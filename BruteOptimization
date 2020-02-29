@@ -1,0 +1,1193 @@
+#Run the script that loads the functions & Packages
+source('H:/NFL_v2/Scripts/Package_Import.R')
+library(ROCR)
+
+#################################
+# Import/assign data from mongo
+#################################
+
+username <- 'thatsmrlongcut'
+password <- 'football17'
+
+#Establish connection with mongo db
+con <-
+  mongo(
+    collection = "NFL",
+    db = "PRE_PROCESS",
+    url = paste0("mongodb+srv://", username, ":", password, '@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+  )
+
+#Drop some variables from out of the gate that you won't be using and
+#Add the observation id
+pre_process <- con$find() %>%
+  filter(Season > 2008) %>%
+  mutate(obs_id = row_number()) %>%
+  dplyr::select(-one_of(c('Game_Date_Time', 'ht_id', 'at_id'))) %>%
+  na.omit()
+rm(con)
+
+#################################
+# Extract the Layer 1 Predictions #
+#################################
+
+#Target variables
+y_vars <- c('Over_Under_Coverage', 'Point_Differential', 'Win_Loss',
+            'Spread_Coverage', 'Game_Total_Points', 'Total_Points',
+            'Total_Points_Alwd')
+
+#Positive Classes (for classification)
+pos_classes <- c('over', NA, 'win', 'covered', NA, NA, NA)
+
+#Set the path to the layer 1 models
+l1_path <- 'H:/NFL_v2/Stacked Models/Layer 1/'
+
+#Create the function to remove model names
+remove_model_names <- function(text) {
+  mnames <- c('_rf.rds', '_lm.rds', '_xgb.rds', '_gbm.rds')
+  for(i in 1:length(mnames)) {
+    if(grepl(mnames[i], text, fixed = TRUE, ignore.case = FALSE)) {
+      text <- gsub(mnames[i], '', text)
+      break
+    }
+  }
+  return(text)
+}
+
+#Grab the layer 1 data frame of predictions
+layer1_prediction_df <-
+  do.call("cbind.data.frame", 
+          lapply(1:length(list.files(l1_path)), function(k) {
+            #Original Model name
+            model_name <- list.files(l1_path)[k]
+            
+            #Read and predict
+            model <- readRDS(paste0(l1_path, model_name))$Model
+            
+            #Grab the features
+            features <- model$features
+            
+            #Grab the type
+            type <- model$task.desc$type
+            
+            #Make a copy of the data
+            df_copy <- pre_process %>%
+              #Grab only the required features
+              dplyr::select(one_of(c(remove_model_names(model_name), model$features)))
+            
+            #Rename the first column
+            colnames(df_copy)[1] <- 'target'
+            
+            #If it is a classification task, identify the positive variable
+            p_var <- pos_classes[match(remove_model_names(model_name), y_vars)]
+            
+            #Transform into a task
+            df_task <- if(type == 'classif') {
+              makeClassifTask(data = df_copy,
+                              target = 'target')
+            } else {
+              makeRegrTask(data = df_copy,
+                           target = 'target')
+            }
+            
+            #Make predictions from the model
+            preds <-
+              if(type == 'regr') {
+                predict(model, df_task)$data$response } else {
+                  predict(model, df_task)$data[, paste0('prob.', p_var)]
+                }
+            
+            #Make into a data frame
+            preds <- data.frame(preds)
+            
+            #Rename column
+            colnames(preds) <- gsub('.rds', '', model_name)
+            
+            #Return the data
+            preds
+          }))
+
+#################################
+# Extract the Layer 2 Predictions #
+#################################
+
+#Target variables
+y_vars <- c('Over_Under_Coverage', 'Point_Differential', 'Win_Loss',
+            'Spread_Coverage', 'Game_Total_Points', 'Total_Points',
+            'Total_Points_Alwd')
+
+#Positive Classes (for classification)
+pos_classes <- c('over', NA, 'win', 'covered', NA, NA, NA)
+
+#Set the path to the layer 1 models
+l2_path <- 'H:/NFL_v2/Stacked Models/Layer 2/'
+
+#Grab the layer 2 data frame of predictions
+layer2_prediction_df <-
+  do.call("cbind.data.frame", 
+          lapply(1:length(list.files(l2_path)), function(k) {
+            #Original Model name
+            model_name <- list.files(l2_path)[k]
+            
+            #Read and predict
+            model <- readRDS(paste0(l2_path, model_name))$Model
+            
+            #Grab the features
+            features <- model$features
+            
+            #Grab the type
+            type <- model$task.desc$type
+            
+            #Make a copy of the data
+            df_copy <- 
+              cbind.data.frame(pre_process,
+                               layer1_prediction_df) %>%
+              #Grab only the required features
+              dplyr::select(one_of(c(gsub('_L2.rds', '', model_name), model$features)))
+            
+            #Rename the first column
+            colnames(df_copy)[1] <- 'target'
+            
+            #If it is a classification task, identify the positive variable
+            p_var <- pos_classes[match(gsub('_L2.rds', '', model_name), y_vars)]
+            
+            #Transform into a task
+            df_task <- if(type == 'classif') {
+              makeClassifTask(data = df_copy,
+                              target = 'target')
+            } else {
+              makeRegrTask(data = df_copy,
+                           target = 'target')
+            }
+            
+            #Make predictions from the model
+            preds <-
+              if(type == 'regr') {
+                predict(model, df_task)$data$response } else {
+                  predict(model, df_task)$data[, paste0('prob.', p_var)]
+                }
+            
+            #Make into a data frame
+            preds <- data.frame(preds)
+            
+            #Rename column
+            colnames(preds) <- gsub('.rds', '', model_name)
+            
+            #Return the data
+            preds
+            
+          }))
+
+#Combine
+df <- cbind.data.frame(pre_process, layer2_prediction_df)
+
+#################################
+# Read and store the classification model predictions #
+#################################
+
+#Target variables
+y_vars <- c('Over_Under_Coverage','Spread_Coverage')
+
+#Positive Classes (for classification)
+pos_classes <- c('over', 'covered')
+
+#Set path where models are stored
+path <- 'H:/NFL_v2/Stacked Models/Parent/'
+
+classification_layer_df <-
+  do.call("cbind.data.frame", 
+          lapply(1:length(y_vars), function(i) {
+            #Establish the variable
+            var <- y_vars[i]
+            
+            #Read in the model
+            model_bin <- readRDS(paste(path, paste0(var, '.rds'), sep = '/'))
+            
+            #Store the model
+            model <- model_bin$Model
+            
+            #Grab the features
+            features <- model$features
+            
+            #Grab the type
+            type <- model$task.desc$type
+            
+            #Make a copy of the data
+            df_copy <- 
+              df %>%
+              #Grab only the required features
+              dplyr::select(one_of(c(var, features)))
+            
+            #Rename the first column
+            colnames(df_copy)[1] <- 'target'
+            
+            #Transform into a task
+            df_task <- if(type == 'classif') {
+              makeClassifTask(data = df_copy,
+                              target = 'target')
+            } else {
+              makeRegrTask(data = df_copy,
+                           target = 'target')
+            }
+            
+            #Make predictions from the model
+            preds <-
+              if(type == 'regr') {
+                predict(model, df_task)$data$response } else {
+                  predict(model, df_task)$data[, paste0('prob.', pos_classes[i])]
+                }
+            
+            #Make into a data frame
+            preds <- data.frame(preds)
+            
+            #Rename column
+            colnames(preds) <- paste0(var, '_Classification_Prediction')
+            
+            #Output
+            preds
+          }))
+
+#Add the parents to the data frame
+df <- 
+  cbind.data.frame(df, classification_layer_df) %>%
+  mutate(OUC_Classification_Binary_Response = ifelse(Over_Under_Coverage_Classification_Prediction > 0.5, 'over', 'under'),
+         SC_Classification_Binary_Response = ifelse(Spread_Coverage_Classification_Prediction > 0.5, 'covered', 'loss'))
+
+#################################
+# Read the continuous models for analysis #
+#################################
+
+#Create the function that will read in the data and make predictions
+read_predict <- function(y_variable, path, pos_class) {
+  #Grab all the model paths for that predictor
+  model_paths <- list.files(paste0(path, y_variable))
+  
+  #Grab all the models for that predictor
+  all_models <- 
+    do.call("c",
+            lapply(1:length(model_paths), function(x) {
+              readRDS(paste(paste0(path, y_variable), model_paths[x], sep = '/'))
+            }))
+  
+  do.call("cbind.data.frame", lapply(1:length(all_models), function(z) {
+    bin_boi <- all_models[[z]]
+    model <- bin_boi$Model
+    
+    #Grab the features
+    features <- model$features
+    
+    #Grab the type
+    type <- model$task.desc$type
+    
+    #Make a copy of the data
+    df_copy <- 
+      df %>%
+      #Grab only the required features
+      dplyr::select(one_of(c(y_variable, features)))
+    
+    #Rename the first column
+    colnames(df_copy)[1] <- 'target'
+    
+    #Transform into a task
+    df_task <- if(type == 'classif') {
+      makeClassifTask(data = df_copy,
+                      target = 'target')
+    } else {
+      makeRegrTask(data = df_copy,
+                   target = 'target')
+    }
+    
+    #Make predictions from the model
+    preds <-
+      if(type == 'regr') {
+        predict(model, df_task)$data$response } else {
+          predict(model, df_task)$data[, paste0('prob.', pos_class)]
+        }
+    
+    #Make into a data frame
+    preds <- data.frame(preds)
+    
+    #Rename column
+    colnames(preds) <- paste0(y_variable, '_pred_', z)
+    
+    #Output the predictions
+    preds
+  }))
+}
+
+calc_auc <- function(values, labs) {
+  #Create the list element
+  ouc.simple <- 
+    list(
+      predictions = values,
+      labels = labs
+    )
+  pred <- prediction(ouc.simple$predictions, ouc.simple$labels)
+  perf <- performance(pred, "auc")
+  perf@y.values[[1]]
+}
+
+#Functiont to pipe into kmeans
+kmeans_pipe <- function(.data, columns, clusters, new_name) {
+  set.seed(100)
+  .data[, new_name] <- kmeans(.data[, columns], centers = clusters)$cluster
+  .data
+}
+
+#################################
+# Establish Variables #
+#################################
+
+#Read in the train test split
+train_test_split <- 
+  read.csv('H:/train_test.csv') %>%
+  filter(TEST == 1) %>%
+  mutate(id = paste(Season, Week, sep = '_')) %>%
+  .$id %>%
+  as.character
+
+#Target variables
+y_vars <- c('Point_Differential','Game_Total_Points', 'Spread_Coverage', 'Over_Under_Coverage')
+
+#Positive Classes (for classification)
+pos_classes <- c(NA, NA, 'covered', 'over')
+
+#Define the current models being used
+cur_models <- c(156, 640, 184, 191)
+
+#Set path where models are stored
+path <- 'H:/NFL_v2/Stacked Models/Final/'
+
+#Create the modified data frame with only the variables of concern
+mod_df <- 
+  df %>%
+  mutate(game_id = paste(Season, Week, Home_Team, Away_Team, sep = '_')) %>%
+  mutate(Set = ifelse(Season == 2019, 'Production', ifelse(paste(Season, Week, sep = '_') %in% train_test_split, 'Test', 'Train'))) %>%
+  dplyr::select(one_of(c('game_id', 'Season', 'Week', 'Set', y_vars, 'SPREAD', 'OVER_UNDER')))
+
+#################################
+# SPREAD COVERAGE CLASSIFICATION #
+#################################
+
+#Combine every model
+idf <-
+  cbind.data.frame(
+    mod_df %>%
+      dplyr::select(one_of(c('game_id', 'Season', 'Week', 'Set', y_vars[3]))),
+    read_predict(y_vars[3], 'H:/NFL_v2/Stacked Models/Final/', pos_classes[3])
+  ) %>%
+  melt(id.vars = c(c('game_id', 'Season', 'Week', 'Set', y_vars[3])))
+
+#Make variable names
+idf$variable <- as.numeric(gsub("Spread_Coverage_pred_", "", idf$variable))
+
+#Plot the over fitness of each
+model_stats <-
+  idf %>%
+  mutate(guess = ifelse(value > 0.5, 'covered', 'loss'),
+         right = ifelse(guess == Spread_Coverage, 1, 0),
+         lab = ifelse(Spread_Coverage == 'covered', 1, 0)) %>%
+  filter(Spread_Coverage != 'push') %>%
+  group_by(variable, Set) %>%
+  summarise(
+    acc = sum(right)/n(),
+    auc = calc_auc(value, lab),
+    tpr = sum(lab == 1 & right == 1)/sum(lab == 1),
+    tnr = sum(lab == 0 & right == 1)/sum(lab == 0)
+    ) %>%
+  mutate(bac = (tpr + tnr)/2) 
+
+#Create a loop that will plot and store the least overfit models for each variable
+vars <- colnames(model_stats)[-(1:2)]
+best_fits <- list()
+
+for(i in 1:length(vars)) {
+  jdf <-
+    model_stats %>%
+    dplyr::select(one_of('variable', 'Set', vars[i])) %>%
+    setNames(c(names(.)[1:2], "var")) %>%
+    spread(Set, var) %>%
+    mutate(difference = ((Train/Test)-1)^2) %>%
+    kmeans_pipe(., c('difference'), 10, 'cluster')
+  
+  best_fits[[i]] <-
+    data.frame(variable = jdf %>%
+    filter(cluster %in% (
+      jdf %>%
+        group_by(cluster) %>%
+        summarise(avg = mean(difference)) %>%
+        filter(avg == min(avg)) %>%
+        .$cluster
+    )) %>%
+    .$variable,
+    measure = vars[i])
+
+  print(
+  jdf %>%
+    ggplot() +
+    geom_point(aes(x = Train, y = Test, colour = as.factor(cluster))) +
+    geom_line(aes(x = Train, y = Train)) +
+    geom_text(aes(x = Train, y = Test, label = variable), vjust = 1.3, check_overlap = TRUE) +
+    theme_fivethirtyeight() +
+    scale_y_continuous(labels = scales::percent, expand = c(0,0)) +
+    scale_x_continuous(labels = scales::percent, expand = c(0,0)) +
+    labs(colour = NULL, title = vars[i]) +
+    theme(axis.title = element_text()) +
+    xlab('Train') + ylab('Test')
+  )
+}
+
+#Filter for only the best
+kept_vars <-
+do.call("rbind", best_fits) %>%
+  group_by(variable) %>%
+  summarise(
+    count = n()
+  ) %>%
+  filter(count == max(count)) %>%
+  .$variable
+
+#Make each combination of each variable
+combn_vars <-
+  do.call("c", lapply(1:length(kept_vars), function(x) {
+  combn_good <- combn(kept_vars, x)
+  lapply(seq_len(ncol(combn_good)), function(i) { combn_good[,i] })
+}))
+
+#Analyze the performance
+combn_perf <-
+  do.call("rbind", lapply(1:length(combn_vars), function(i) {
+    idf %>%
+      filter(variable %in% combn_vars[[i]]) %>%
+      group_by(game_id, Season, Week, Set, Spread_Coverage) %>%
+      summarise(value = mean(value)) %>%
+      as.data.frame %>%
+      group_by(Season, Week, Set) %>%
+      mutate(guess = ifelse(value > 0.5, 'covered', 'loss'),
+             right = ifelse(guess == Spread_Coverage, 1, 0),
+             lab = ifelse(Spread_Coverage == 'covered', 1, 0)) %>%
+      filter(Spread_Coverage != 'push') %>%
+      group_by(Set) %>%
+      summarise(
+        acc = sum(right)/n(),
+        auc = calc_auc(value, lab),
+        tpr = sum(lab == 1 & right == 1)/sum(lab == 1),
+        tnr = sum(lab == 0 & right == 1)/sum(lab == 0)
+      ) %>%
+      mutate(bac = (tpr + tnr)/2) %>%
+      as.data.frame %>%
+      mutate(id = i)
+  }))
+
+#Create a loop that will plot and store the least overfit models for each variable
+best_fits <- list()
+
+for(i in 1:length(vars)) {
+  jdf <-
+    combn_perf %>%
+    dplyr::select(one_of('id', 'Set', vars[i])) %>%
+    setNames(c(names(.)[1:2], "var")) %>%
+    spread(Set, var) %>%
+    mutate(difference = ((Train/Test)-1)^2) %>%
+    kmeans_pipe(., c('difference'), 10, 'cluster')
+  
+  best_fits[[i]] <-
+    data.frame(variable = jdf %>%
+                 filter(cluster %in% (
+                   jdf %>%
+                     group_by(cluster) %>%
+                     summarise(avg = mean(difference)) %>%
+                     filter(avg == min(avg)) %>%
+                     .$cluster
+                 )) %>%
+                 .$id,
+               measure = vars[i])
+  
+  print(
+    jdf %>%
+      ggplot() +
+      geom_point(aes(x = Train, y = Test, colour = as.factor(cluster))) +
+      geom_line(aes(x = Train, y = Train)) +
+      geom_text(aes(x = Train, y = Test, label = id), vjust = 1.3, check_overlap = TRUE) +
+      theme_fivethirtyeight() +
+      scale_y_continuous(labels = scales::percent, expand = c(0,0)) +
+      scale_x_continuous(labels = scales::percent, expand = c(0,0)) +
+      labs(colour = NULL, title = vars[i]) +
+      theme(axis.title = element_text()) +
+      xlab('Train') + ylab('Test')
+  )
+}
+
+
+#Filter for only the best
+kept_vars <-
+  do.call("rbind", best_fits) %>%
+  group_by(variable) %>%
+  summarise(
+    count = n()
+  ) %>%
+  filter(count == max(count)) %>%
+  .$variable
+
+#Find your best (MANUAL)
+combn_perf %>% filter(id %in% kept_vars) %>% arrange(desc(acc))
+
+best <- 71
+best_final <- combn_vars[[best]]
+
+#Grab all the model paths for that predictor
+model_paths <- list.files(paste0(path, 'Spread_Coverage'))
+
+#Grab all the models for that predictor
+all_models <- 
+  do.call("c",
+          lapply(1:length(model_paths), function(x) {
+            readRDS(paste(paste0(path, 'Spread_Coverage'), model_paths[x], sep = '/'))
+          }))
+
+#Subset for justtttt the ones you want
+final_models <- all_models[best_final]
+
+#Save
+saveRDS(final_models, "H:/NFL_v2/Stacked Models/Aggregate/Spread_Coverage.rds")
+
+#################################
+# OVER UNDER COVERAGE CLASSIFICATION #
+#################################
+
+#Combine every model
+idf <-
+  cbind.data.frame(
+    mod_df %>%
+      dplyr::select(one_of(c('game_id', 'Season', 'Week', 'Set', y_vars[4]))),
+    read_predict(y_vars[4], 'H:/NFL_v2/Stacked Models/Final/', pos_classes[4])
+  ) %>%
+  melt(id.vars = c(c('game_id', 'Season', 'Week', 'Set', y_vars[4])))
+
+#Make variable names
+idf$variable <- as.numeric(gsub("Over_Under_Coverage_pred_", "", idf$variable))
+
+#Plot the over fitness of each
+model_stats <-
+  idf %>%
+  mutate(guess = ifelse(value > 0.5, 'over', 'under'),
+         right = ifelse(guess == Over_Under_Coverage, 1, 0),
+         lab = ifelse(Over_Under_Coverage == 'over', 1, 0)) %>%
+  filter(Over_Under_Coverage != 'push') %>%
+  group_by(variable, Set) %>%
+  summarise(
+    acc = sum(right)/n(),
+    auc = calc_auc(value, lab),
+    tpr = sum(lab == 1 & right == 1)/sum(lab == 1),
+    tnr = sum(lab == 0 & right == 1)/sum(lab == 0)
+  ) %>%
+  mutate(bac = (tpr + tnr)/2) 
+
+#Create a loop that will plot and store the least overfit models for each variable
+vars <- colnames(model_stats)[-(1:2)]
+best_fits <- list()
+
+for(i in 1:length(vars)) {
+  jdf <-
+    model_stats %>%
+    dplyr::select(one_of('variable', 'Set', vars[i])) %>%
+    setNames(c(names(.)[1:2], "var")) %>%
+    spread(Set, var) %>%
+    mutate(difference = ((Train/Test)-1)^2) %>%
+    kmeans_pipe(., c('difference'), 10, 'cluster')
+  
+  best_fits[[i]] <-
+    data.frame(variable = jdf %>%
+                 filter(cluster %in% (
+                   jdf %>%
+                     group_by(cluster) %>%
+                     summarise(avg = mean(difference)) %>%
+                     filter(avg == min(avg)) %>%
+                     .$cluster
+                 )) %>%
+                 .$variable,
+               measure = vars[i])
+  
+  print(
+    jdf %>%
+      ggplot() +
+      geom_point(aes(x = Train, y = Test, colour = as.factor(cluster))) +
+      geom_line(aes(x = Train, y = Train)) +
+      geom_text(aes(x = Train, y = Test, label = variable), vjust = 1.3, check_overlap = TRUE) +
+      theme_fivethirtyeight() +
+      scale_y_continuous(labels = scales::percent, expand = c(0,0)) +
+      scale_x_continuous(labels = scales::percent, expand = c(0,0)) +
+      labs(colour = NULL, title = vars[i]) +
+      theme(axis.title = element_text()) +
+      xlab('Train') + ylab('Test')
+  )
+}
+
+#Filter for only the best
+kept_vars <-
+  do.call("rbind", best_fits) %>%
+  group_by(variable) %>%
+  summarise(
+    count = n()
+  ) %>%
+  filter(count == max(count)) %>%
+  .$variable
+
+#Make each combination of each variable
+combn_vars <-
+  do.call("c", lapply(1:length(kept_vars), function(x) {
+    combn_good <- combn(kept_vars, x)
+    lapply(seq_len(ncol(combn_good)), function(i) { combn_good[,i] })
+  }))
+
+#Analyze the performance
+combn_perf <-
+  do.call("rbind", lapply(1:length(combn_vars), function(i) {
+    idf %>%
+      filter(variable %in% combn_vars[[i]]) %>%
+      group_by(game_id, Season, Week, Set, Over_Under_Coverage) %>%
+      summarise(value = mean(value)) %>%
+      as.data.frame %>%
+      group_by(Season, Week, Set) %>%
+      mutate(guess = ifelse(value > 0.5, 'over', 'under'),
+             right = ifelse(guess == Over_Under_Coverage, 1, 0),
+             lab = ifelse(Over_Under_Coverage == 'over', 1, 0)) %>%
+      filter(Over_Under_Coverage != 'push') %>%
+      group_by(Set) %>%
+      summarise(
+        acc = sum(right)/n(),
+        auc = calc_auc(value, lab),
+        tpr = sum(lab == 1 & right == 1)/sum(lab == 1),
+        tnr = sum(lab == 0 & right == 1)/sum(lab == 0)
+      ) %>%
+      mutate(bac = (tpr + tnr)/2) %>%
+      as.data.frame %>%
+      mutate(id = i)
+  }))
+
+#Create a loop that will plot and store the least overfit models for each variable
+best_fits <- list()
+
+for(i in 1:length(vars)) {
+  jdf <-
+    combn_perf %>%
+    dplyr::select(one_of('id', 'Set', vars[i])) %>%
+    setNames(c(names(.)[1:2], "var")) %>%
+    spread(Set, var) %>%
+    mutate(difference = ((Train/Test)-1)^2) %>%
+    kmeans_pipe(., c('difference'), 10, 'cluster')
+  
+  best_fits[[i]] <-
+    data.frame(variable = jdf %>%
+                 filter(cluster %in% (
+                   jdf %>%
+                     group_by(cluster) %>%
+                     summarise(avg = mean(difference)) %>%
+                     filter(avg == min(avg)) %>%
+                     .$cluster
+                 )) %>%
+                 .$id,
+               measure = vars[i])
+  
+  print(
+    jdf %>%
+      ggplot() +
+      geom_point(aes(x = Train, y = Test, colour = as.factor(cluster))) +
+      geom_line(aes(x = Train, y = Train)) +
+      geom_text(aes(x = Train, y = Test, label = id), vjust = 1.3, check_overlap = TRUE) +
+      theme_fivethirtyeight() +
+      scale_y_continuous(labels = scales::percent, expand = c(0,0)) +
+      scale_x_continuous(labels = scales::percent, expand = c(0,0)) +
+      labs(colour = NULL, title = vars[i]) +
+      theme(axis.title = element_text()) +
+      xlab('Train') + ylab('Test')
+  )
+}
+
+
+#Filter for only the best
+kept_vars <-
+  do.call("rbind", best_fits) %>%
+  group_by(variable) %>%
+  summarise(
+    count = n()
+  ) %>%
+  filter(count == max(count)) %>%
+  .$variable
+
+#Find your best (MANUAL)
+combn_perf %>% 
+  filter(id %in% kept_vars,
+         #Set == 'Test'
+         ) %>% 
+  arrange(desc(acc))
+
+best <- 216
+best_final <- combn_vars[[best]]
+
+#Grab all the model paths for that predictor
+model_paths <- list.files(paste0(path, 'Over_Under_Coverage'))
+
+#Grab all the models for that predictor
+all_models <- 
+  do.call("c",
+          lapply(1:length(model_paths), function(x) {
+            readRDS(paste(paste0(path, 'Over_Under_Coverage'), model_paths[x], sep = '/'))
+          }))
+
+#Subset for justtttt the ones you want
+final_models <- all_models[best_final]
+
+#Save
+saveRDS(final_models, "H:/NFL_v2/Stacked Models/Aggregate/Over_Under_Coverage.rds")
+
+#################################
+# Point Differential #
+#################################
+
+#Combine every model
+idf <-
+  cbind.data.frame(
+    mod_df %>%
+      dplyr::select(one_of(c('game_id', 'Season', 'Week', 'Set', y_vars[1], 'Spread_Coverage', 'SPREAD'))),
+    read_predict(y_vars[1], 'H:/NFL_v2/Stacked Models/Final/', pos_classes[1])
+  ) %>%
+  melt(id.vars = c(c('game_id', 'Season', 'Week', 'Set', 'Spread_Coverage', 'SPREAD', y_vars[1])))
+
+#Make variable names
+idf$variable <- as.numeric(gsub("Point_Differential_pred_", "", idf$variable))
+
+#Grab all of the IDs
+ids <- unique(idf$variable)
+
+#Define how overfit each one is
+overfit_metrics <-
+  do.call("rbind", lapply(1:length(ids), function(z) {
+    #Gather the performance metrics
+    perf_metrics <-
+      idf %>%
+      filter(variable == ids[z]) %>%
+      group_by(Set) %>%
+      summarise(
+        rmse = sqrt(mean((value - Point_Differential)^2)),
+        corr = cor(value, Point_Differential),
+        sse = sum((value - Point_Differential)^2)
+      )
+    
+    #Now run a sample to see how unlikely the test metrics would be
+    tst_set <-
+      idf %>%
+      filter(variable == ids[z],
+             Set == 'Train')
+    
+    sample_set <- 
+      do.call("rbind", lapply(1:5, function(x) {
+        tst_set[sample(1:nrow(tst_set), 497),] %>%
+          summarise(
+            rmse = sqrt(mean((value - Point_Differential)^2)),
+            corr = cor(value, Point_Differential),
+            sse = sum((value - Point_Differential)^2)
+          )
+      })) %>%
+      summarise_all(list(avg = mean, stdev = sd))
+    
+    perf_metrics %>%
+      mutate(rmse_z = (rmse - sample_set$rmse_avg)/sample_set$rmse_stdev,
+             corr_z = abs((corr - sample_set$corr_avg)/sample_set$corr_stdev),
+             sse_z = (sse - sample_set$sse_avg)/sample_set$sse_stdev) %>%
+      filter(Set == 'Test') %>%
+      mutate(variable = z)
+  }))
+
+#Define the vars you want to grade
+vars <- c("rmse", "corr", "sse")
+best_fits <- list()
+
+for(i in 1:length(vars)) {
+  jdf <-
+    overfit_metrics %>%
+    dplyr::select(one_of('variable', vars[i], paste0(vars[i], "_z"))) %>%
+    setNames(c(names(.)[1], "var", "var_z")) %>%
+    mutate(difference = (var_z^2)) %>%
+    kmeans_pipe(., c('difference'), 3, 'cluster')
+  
+  best_fits[[i]] <-
+    data.frame(variable = jdf %>%
+               filter(cluster %in% (
+                 jdf %>%
+                   group_by(cluster) %>%
+                   summarise(avg = mean(difference)) %>%
+                   filter(avg == min(avg)) %>%
+                   .$cluster
+               )) %>%
+               .$variable,
+             measure = vars[i])
+  
+  print(
+  jdf %>%
+    ggplot() +
+    geom_point(aes(x = var, y = var_z, colour = as.factor(cluster))) +
+    geom_text(aes(x = var, y = var_z, label = variable), vjust = 1.3, check_overlap = TRUE) +
+    labs(title = vars[i])
+  )
+  
+}
+
+#Filter for only the best
+kept_vars <-
+  do.call("rbind", best_fits) %>%
+  group_by(variable) %>%
+  summarise(
+    count = n()
+  ) %>%
+  arrange(desc(count)) %>%
+  top_n(10, count) %>%
+  # filter(count == max(count)) %>%
+  .$variable
+
+if(length(kept_vars) > 10) { kept_vars <- rev(kept_vars)[1:10] }
+
+#Make each combination of each variable
+combn_vars <-
+  do.call("c", lapply(1:length(kept_vars), function(x) {
+    combn_good <- combn(kept_vars, x)
+    lapply(seq_len(ncol(combn_good)), function(i) { combn_good[,i] })
+  }))
+
+#Analyze the performance
+combn_perf <-
+  do.call("rbind", lapply(1:length(combn_vars), function(i) {
+    idf %>%
+      filter(variable %in% combn_vars[[i]]) %>%
+      group_by(game_id, Season, Week, Set, Spread_Coverage, SPREAD, Point_Differential) %>%
+      summarise(value = mean(value)) %>%
+      as.data.frame %>%
+      group_by(Season, Week, Set) %>%
+      mutate(guess = ifelse((SPREAD + value) > 0, 'covered', 'loss'),
+             right = ifelse(guess == Spread_Coverage, 1, 0),
+             lab = ifelse(Spread_Coverage == 'covered', 1, 0)) %>%
+      filter(Spread_Coverage != 'push') %>%
+      group_by(Set) %>%
+      summarise(
+        acc = sum(right)/n(),
+        tpr = sum(lab == 1 & right == 1)/sum(lab == 1),
+        tnr = sum(lab == 0 & right == 1)/sum(lab == 0)
+      ) %>%
+      mutate(bac = (tpr + tnr)/2) %>%
+      as.data.frame %>%
+      mutate(id = i)
+  }))
+
+#Create a loop that will plot and store the least overfit models for each variable
+vars <- c("acc", "tpr", "tnr", "bac")
+best_fits <- list()
+
+for(i in 1:length(vars)) {
+  jdf <-
+    combn_perf %>%
+    dplyr::select(one_of('id', 'Set', vars[i])) %>%
+    setNames(c(names(.)[1:2], "var")) %>%
+    spread(Set, var) %>%
+    mutate(difference = ((Train/Test)-1)^2) %>%
+    kmeans_pipe(., c('difference'), 3, 'cluster')
+  
+  best_fits[[i]] <-
+    data.frame(variable = jdf %>%
+                 filter(cluster %in% (
+                   jdf %>%
+                     group_by(cluster) %>%
+                     summarise(avg = mean(difference)) %>%
+                     filter(avg == min(avg)) %>%
+                     .$cluster
+                 )) %>%
+                 .$id,
+               measure = vars[i])
+  
+  print(
+    jdf %>%
+      ggplot() +
+      geom_point(aes(x = Train, y = Test, colour = as.factor(cluster))) +
+      geom_line(aes(x = Train, y = Train)) +
+      geom_text(aes(x = Train, y = Test, label = id), vjust = 1.3, check_overlap = TRUE) +
+      theme_fivethirtyeight() +
+      scale_y_continuous(labels = scales::percent, expand = c(0,0)) +
+      scale_x_continuous(labels = scales::percent, expand = c(0,0)) +
+      labs(colour = NULL, title = vars[i]) +
+      theme(axis.title = element_text()) +
+      xlab('Train') + ylab('Test')
+  )
+}
+
+
+#Filter for only the best
+kept_vars <-
+  do.call("rbind", best_fits) %>%
+  group_by(variable) %>%
+  summarise(
+    count = n()
+  ) %>%
+  top_n(10, count) %>%
+  # filter(count == max(count)) %>%
+  .$variable
+
+#Find your best (MANUAL)
+combn_perf %>% 
+  filter(id %in% kept_vars,
+         #Set == 'Test'
+  ) %>% 
+  arrange(desc(acc))
+
+best <- 157
+best_final <- combn_vars[[best]]
+
+#Grab all the model paths for that predictor
+model_paths <- list.files(paste0(path, 'Point_Differential'))
+
+#Grab all the models for that predictor
+all_models <- 
+  do.call("c",
+          lapply(1:length(model_paths), function(x) {
+            readRDS(paste(paste0(path, 'Point_Differential'), model_paths[x], sep = '/'))
+          }))
+
+#Subset for justtttt the ones you want
+final_models <- all_models[best_final]
+
+#Save
+saveRDS(final_models, "H:/NFL_v2/Stacked Models/Aggregate/Point_Differential.rds")
+
+
+#################################
+# GAME TOTAL POINTS #
+#################################
+
+#Combine every model
+idf <-
+  cbind.data.frame(
+    mod_df %>%
+      dplyr::select(one_of(c('game_id', 'Season', 'Week', 'Set', y_vars[2], 'Over_Under_Coverage', 'OVER_UNDER'))),
+    read_predict(y_vars[2], 'H:/NFL_v2/Stacked Models/Final/', pos_classes[2])
+  ) %>%
+  melt(id.vars = c(c('game_id', 'Season', 'Week', 'Set', 'Over_Under_Coverage', 'OVER_UNDER', y_vars[2])))
+
+#Make variable names
+idf$variable <- as.numeric(gsub("Game_Total_Points_pred_", "", idf$variable))
+
+#Grab all of the IDs
+ids <- unique(idf$variable)
+
+#Define how overfit each one is
+overfit_metrics <-
+  do.call("rbind", lapply(1:length(ids), function(z) {
+    #Gather the performance metrics
+    perf_metrics <-
+      idf %>%
+      filter(variable == ids[z]) %>%
+      mutate(guess = ifelse((value - OVER_UNDER) > 0, 'over', 'under'),
+             right = ifelse(guess == Over_Under_Coverage, 1, 0),
+             lab = ifelse(Over_Under_Coverage == 'over', 1, 0)) %>%
+      filter(Over_Under_Coverage != 'push') %>%
+      group_by(Set) %>%
+      summarise(
+        rmse = sqrt(mean((value - Game_Total_Points)^2)),
+        corr = cor(value, Game_Total_Points),
+        sse = sum((value - Game_Total_Points)^2),
+        acc = sum(right)/n(),
+        tpr = sum(lab == 1 & right == 1)/sum(lab == 1),
+        tnr = sum(lab == 0 & right == 1)/sum(lab == 0)
+      ) %>%
+      mutate(bac = (tpr + tnr)/2)
+    
+    #Now run a sample to see how unlikely the test metrics would be
+    tst_set <-
+      idf %>%
+      filter(variable == ids[z],
+             Set == 'Train')
+    
+    sample_set <- 
+      do.call("rbind", lapply(1:5, function(x) {
+        tst_set[sample(1:nrow(tst_set), 497),] %>%
+          mutate(guess = ifelse((value - OVER_UNDER) > 0, 'over', 'under'),
+                 right = ifelse(guess == Over_Under_Coverage, 1, 0),
+                 lab = ifelse(Over_Under_Coverage == 'over', 1, 0)) %>%
+          filter(Over_Under_Coverage != 'push') %>%
+          summarise(
+            rmse = sqrt(mean((value - Game_Total_Points)^2)),
+            corr = cor(value, Game_Total_Points),
+            sse = sum((value - Game_Total_Points)^2),
+            acc = sum(right)/n(),
+            tpr = sum(lab == 1 & right == 1)/sum(lab == 1),
+            tnr = sum(lab == 0 & right == 1)/sum(lab == 0)
+          ) %>%
+          mutate(bac = (tpr + tnr)/2)
+      })) %>%
+      summarise_all(list(avg = mean, stdev = sd))
+    
+    perf_metrics %>%
+      mutate(rmse_z = (rmse - sample_set$rmse_avg)/sample_set$rmse_stdev,
+             corr_z = abs((corr - sample_set$corr_avg)/sample_set$corr_stdev),
+             sse_z = (sse - sample_set$sse_avg)/sample_set$sse_stdev,
+             acc_z = abs((acc - sample_set$acc_avg)/sample_set$acc_stdev),
+             bac_z = abs((bac - sample_set$bac_avg)/sample_set$bac_stdev),
+             tpr_z = abs((tpr - sample_set$tpr_avg)/sample_set$tpr_stdev),
+             tnr_z = abs((tnr - sample_set$tnr_avg)/sample_set$tnr_stdev)) %>%
+      filter(Set == 'Test') %>%
+      mutate(variable = z)
+  }))
+
+#Define the vars you want to grade
+vars <- c("rmse", "corr", "sse", "acc", "bac", "tpr", "tnr")
+best_fits <- list()
+
+for(i in 1:length(vars)) {
+  jdf <-
+    overfit_metrics %>%
+    dplyr::select(one_of('variable', vars[i], paste0(vars[i], "_z"))) %>%
+    setNames(c(names(.)[1], "var", "var_z")) %>%
+    mutate(difference = (var_z^2)) %>%
+    kmeans_pipe(., c('difference'), 10, 'cluster')
+  
+  best_fits[[i]] <-
+    data.frame(variable = jdf %>%
+                 filter(cluster %in% (
+                   jdf %>%
+                     group_by(cluster) %>%
+                     summarise(avg = mean(difference)) %>%
+                     filter(avg == min(avg)) %>%
+                     .$cluster
+                 )) %>%
+                 .$variable,
+               measure = vars[i])
+  
+  print(
+    jdf %>%
+      ggplot() +
+      geom_point(aes(x = var, y = var_z, colour = as.factor(cluster))) +
+      geom_text(aes(x = var, y = var_z, label = variable), vjust = 1.3, check_overlap = TRUE) +
+      labs(title = vars[i])
+  )
+  
+}
+
+#Filter for only the best
+kept_vars <-
+  do.call("rbind", best_fits) %>%
+  group_by(variable) %>%
+  summarise(
+    count = n()
+  ) %>%
+  top_n(10, count) %>%
+  # filter(count == max(count)) %>%
+  .$variable
+
+if(length(kept_vars) > 10) { kept_vars <- kept_vars[sample(1:length(kept_vars), 10)] }
+
+#Make each combination of each variable
+combn_vars <-
+  do.call("c", lapply(1:length(kept_vars), function(x) {
+    combn_good <- combn(kept_vars, x)
+    lapply(seq_len(ncol(combn_good)), function(i) { combn_good[,i] })
+  }))
+
+#Analyze the performance
+combn_perf <-
+  do.call("rbind", lapply(1:length(combn_vars), function(i) {
+    idf %>%
+      filter(variable %in% combn_vars[[i]]) %>%
+      group_by(game_id, Season, Week, Set, Over_Under_Coverage, OVER_UNDER, Game_Total_Points) %>%
+      summarise(value = mean(value)) %>%
+      as.data.frame %>%
+      group_by(Season, Week, Set) %>%
+      mutate(guess = ifelse((value - OVER_UNDER) > 0, 'over', 'under'),
+             right = ifelse(guess == Over_Under_Coverage, 1, 0),
+             lab = ifelse(Over_Under_Coverage == 'over', 1, 0)) %>%
+      filter(Over_Under_Coverage != 'push') %>%
+      group_by(Set) %>%
+      summarise(
+        acc = sum(right)/n(),
+        tpr = sum(lab == 1 & right == 1)/sum(lab == 1),
+        tnr = sum(lab == 0 & right == 1)/sum(lab == 0)
+      ) %>%
+      mutate(bac = (tpr + tnr)/2) %>%
+      as.data.frame %>%
+      mutate(id = i)
+  }))
+
+#Create a loop that will plot and store the least overfit models for each variable
+vars <- c("acc", "tpr", "tnr", "bac")
+best_fits <- list()
+
+for(i in 1:length(vars)) {
+  jdf <-
+    combn_perf %>%
+    dplyr::select(one_of('id', 'Set', vars[i])) %>%
+    setNames(c(names(.)[1:2], "var")) %>%
+    spread(Set, var) %>%
+    mutate(difference = ((Train/Test)-1)^2) %>%
+    kmeans_pipe(., c('difference'), 10, 'cluster')
+  
+  best_fits[[i]] <-
+    data.frame(variable = jdf %>%
+                 filter(cluster %in% (
+                   jdf %>%
+                     group_by(cluster) %>%
+                     summarise(avg = mean(difference)) %>%
+                     filter(avg == min(avg)) %>%
+                     .$cluster
+                 )) %>%
+                 .$id,
+               measure = vars[i])
+  
+  print(
+    jdf %>%
+      ggplot() +
+      geom_point(aes(x = Train, y = Test, colour = as.factor(cluster))) +
+      geom_line(aes(x = Train, y = Train)) +
+      geom_text(aes(x = Train, y = Test, label = id), vjust = 1.3, check_overlap = TRUE) +
+      theme_fivethirtyeight() +
+      scale_y_continuous(labels = scales::percent, expand = c(0,0)) +
+      scale_x_continuous(labels = scales::percent, expand = c(0,0)) +
+      labs(colour = NULL, title = vars[i]) +
+      theme(axis.title = element_text()) +
+      xlab('Train') + ylab('Test')
+  )
+}
+
+
+#Filter for only the best
+kept_vars <-
+  do.call("rbind", best_fits) %>%
+  group_by(variable) %>%
+  summarise(
+    count = n()
+  ) %>%
+  top_n(10, count) %>%
+  # filter(count == max(count)) %>%
+  .$variable
+
+#Find your best (MANUAL)
+combn_perf %>% 
+  filter(id %in% kept_vars,
+         #Set == 'Test'
+  ) %>% 
+  arrange(desc(acc))
+
+best <- 6
+best_final <- combn_vars[[best]]
+best_final
+
+
+#Grab all the model paths for that predictor
+model_paths <- list.files(paste0(path, 'Game_Total_Points'))
+
+#Grab all the models for that predictor
+all_models <- 
+  do.call("c",
+          lapply(1:length(model_paths), function(x) {
+            readRDS(paste(paste0(path, 'Game_Total_Points'), model_paths[x], sep = '/'))
+          }))
+
+#Subset for justtttt the ones you want
+final_models <- all_models[best_final]
+
+#Save
+saveRDS(final_models, "H:/NFL_v2/Stacked Models/Aggregate/Game_Total_Points.rds")
