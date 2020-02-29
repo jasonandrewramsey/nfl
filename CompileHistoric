@@ -1,0 +1,398 @@
+#Run the script that loads the functions & Packages
+source('H:/NFL_v2/Scripts/Package_Import.R')
+
+#################################
+# Import/assign data from mongo
+#################################
+
+#Establish connection with mongo db
+con <-
+  mongo(
+    collection = "NFL",
+    db = "PRE_PROCESS",
+    url = "mongodb+srv://thatsmrlongcut:football17@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority"
+  )
+
+#Drop some variables from out of the gate that you won't be using and
+#Add the observation id
+pre_process <- 
+  con$find() %>%
+  filter(Season > 2008) %>%
+  mutate(obs_id = row_number()) %>%
+  dplyr::select(-one_of(c('Game_Date_Time', 'ht_id', 'at_id'))) %>%
+  na.omit()
+rm(con)
+
+#################################
+# Extract the Layer 1 Predictions #
+#################################
+
+#Target variables
+y_vars <- c('Over_Under_Coverage', 'Point_Differential', 'Win_Loss',
+            'Spread_Coverage', 'Game_Total_Points', 'Total_Points',
+            'Total_Points_Alwd')
+
+#Positive Classes (for classification)
+pos_classes <- c('over', NA, 'win', 'covered', NA, NA, NA)
+
+#Set the path to the layer 1 models
+l1_path <- 'H:/NFL_v2/Stacked Models/Layer 1/'
+
+#Create the function to remove model names
+remove_model_names <- function(text) {
+  mnames <- c('_rf.rds', '_lm.rds', '_xgb.rds', '_gbm.rds')
+  for(i in 1:length(mnames)) {
+    if(grepl(mnames[i], text, fixed = TRUE, ignore.case = FALSE)) {
+      text <- gsub(mnames[i], '', text)
+      break
+    }
+  }
+  return(text)
+}
+
+#Grab the layer 1 data frame of predictions
+layer1_prediction_df <-
+  do.call("cbind.data.frame", 
+          lapply(1:length(list.files(l1_path)), function(k) {
+            #Original Model name
+            model_name <- list.files(l1_path)[k]
+            
+            #Read and predict
+            model <- readRDS(paste0(l1_path, model_name))$Model
+            
+            #Grab the features
+            features <- model$features
+            
+            #Grab the type
+            type <- model$task.desc$type
+            
+            #Make a copy of the data
+            df_copy <- pre_process %>%
+              #Grab only the required features
+              dplyr::select(one_of(c(remove_model_names(model_name), model$features)))
+            
+            #Rename the first column
+            colnames(df_copy)[1] <- 'target'
+            
+            #If it is a classification task, identify the positive variable
+            p_var <- pos_classes[match(remove_model_names(model_name), y_vars)]
+            
+            #Transform into a task
+            df_task <- if(type == 'classif') {
+              makeClassifTask(data = df_copy,
+                              target = 'target')
+            } else {
+              makeRegrTask(data = df_copy,
+                           target = 'target')
+            }
+            
+            #Make predictions from the model
+            preds <-
+              if(type == 'regr') {
+                predict(model, df_task)$data$response } else {
+                  predict(model, df_task)$data[, paste0('prob.', p_var)]
+                }
+            
+            #Make into a data frame
+            preds <- data.frame(preds)
+            
+            #Rename column
+            colnames(preds) <- gsub('.rds', '', model_name)
+            
+            #Return the data
+            preds
+          }))
+
+#################################
+# Extract the Layer 2 Predictions #
+#################################
+
+#Target variables
+y_vars <- c('Over_Under_Coverage', 'Point_Differential', 'Win_Loss',
+            'Spread_Coverage', 'Game_Total_Points', 'Total_Points',
+            'Total_Points_Alwd')
+
+#Positive Classes (for classification)
+pos_classes <- c('over', NA, 'win', 'covered', NA, NA, NA)
+
+#Set the path to the layer 1 models
+l2_path <- 'H:/NFL_v2/Stacked Models/Layer 2/'
+
+#Grab the layer 2 data frame of predictions
+layer2_prediction_df <-
+  do.call("cbind.data.frame", 
+          lapply(1:length(list.files(l2_path)), function(k) {
+            #Original Model name
+            model_name <- list.files(l2_path)[k]
+            
+            #Read and predict
+            model <- readRDS(paste0(l2_path, model_name))$Model
+            
+            #Grab the features
+            features <- model$features
+            
+            #Grab the type
+            type <- model$task.desc$type
+            
+            #Make a copy of the data
+            df_copy <- 
+              cbind.data.frame(pre_process,
+                               layer1_prediction_df) %>%
+              #Grab only the required features
+              dplyr::select(one_of(c(gsub('_L2.rds', '', model_name), model$features)))
+            
+            #Rename the first column
+            colnames(df_copy)[1] <- 'target'
+            
+            #If it is a classification task, identify the positive variable
+            p_var <- pos_classes[match(gsub('_L2.rds', '', model_name), y_vars)]
+            
+            #Transform into a task
+            df_task <- if(type == 'classif') {
+              makeClassifTask(data = df_copy,
+                              target = 'target')
+            } else {
+              makeRegrTask(data = df_copy,
+                           target = 'target')
+            }
+            
+            #Make predictions from the model
+            preds <-
+              if(type == 'regr') {
+                predict(model, df_task)$data$response } else {
+                  predict(model, df_task)$data[, paste0('prob.', p_var)]
+                }
+            
+            #Make into a data frame
+            preds <- data.frame(preds)
+            
+            #Rename column
+            colnames(preds) <- gsub('.rds', '', model_name)
+            
+            #Return the data
+            preds
+            
+          }))
+
+#Combine
+df <- cbind.data.frame(pre_process, layer2_prediction_df)
+
+#################################
+# Read and store the classification model predictions #
+#################################
+
+#Target variables
+y_vars <- c('Over_Under_Coverage','Spread_Coverage')
+
+#Positive Classes (for classification)
+pos_classes <- c('over', 'covered')
+
+#Set path where models are stored
+path <- 'H:/NFL_v2/Stacked Models/Aggregate/'
+
+classification_layer_df <-
+  do.call("cbind.data.frame", 
+          lapply(1:length(y_vars), function(i) {
+            
+            #Establish the variable
+            var <- y_vars[i]
+            
+            #Read in the model
+            model_bin <- readRDS(paste(path, paste0(var, '.rds'), sep = '/'))
+            
+            #Read and predict for each model
+            tgbtg <-
+              do.call("cbind.data.frame", 
+                      lapply(1:length(model_bin), function(j) {
+                        #Store the model
+                        model <- model_bin[[j]]$Model
+                        
+                        #Grab the features
+                        features <- model$features
+                        
+                        #Grab the type
+                        type <- model$task.desc$type
+                        
+                        #Make a copy of the data
+                        df_copy <- 
+                          df %>%
+                          #Grab only the required features
+                          dplyr::select(one_of(c(var, features)))
+                        
+                        #Rename the first column
+                        colnames(df_copy)[1] <- 'target'
+                        
+                        #Transform into a task
+                        df_task <- if(type == 'classif') {
+                          makeClassifTask(data = df_copy,
+                                          target = 'target')
+                        } else {
+                          makeRegrTask(data = df_copy,
+                                       target = 'target')
+                        }
+                        
+                        #Make predictions from the model
+                        preds <-
+                          if(type == 'regr') {
+                            predict(model, df_task)$data$response } else {
+                              predict(model, df_task)$data[, paste0('prob.', pos_classes[i])]
+                            }
+                        
+                        #Make into a data frame
+                        preds <- data.frame(preds)
+                        colnames(preds) <- paste0('M', j)
+                        preds
+                      }))
+            
+            #Average each column
+            preds <- data.frame(do.call("c", lapply(1:nrow(tgbtg), function(j) {
+              mean(as.numeric(tgbtg[j,]))
+            })))
+            
+            #Rename column
+            colnames(preds) <- paste0(var, '_Classification_Prediction')
+            
+            #Output
+            preds
+          }))
+
+#Add the parents to the data frame
+df <- 
+  cbind.data.frame(df, classification_layer_df) %>%
+  mutate(OUC_Classification_Binary_Response = ifelse(Over_Under_Coverage_Classification_Prediction > 0.5, 'over', 'under'),
+         SC_Classification_Binary_Response = ifelse(Spread_Coverage_Classification_Prediction > 0.5, 'covered', 'loss'))
+
+#################################
+# Read the continuous models for analysis #
+#################################
+
+#Target variables
+y_vars <- c('Game_Total_Points','Point_Differential')
+
+#Folder names
+x_vars <- c('Over_Under_Coverage','Spread_Coverage')
+
+#Set path where models are stored
+path <- 'H:/NFL_v2/Stacked Models/Aggregate/'
+
+#Positive Classes (for classification)
+pos_classes <- c('over', 'covered')
+
+continuous_layer_df <-
+  do.call("cbind.data.frame", 
+          lapply(1:length(y_vars), function(i) {
+            
+            #Establish the variable
+            var <- y_vars[i]
+            
+            #Read in the model
+            model_bin <- readRDS(paste(path, paste0(var, '.rds'), sep = '/'))
+            
+            #Read and predict for each model
+            tgbtg <-
+              do.call("cbind.data.frame", 
+                      lapply(1:length(model_bin), function(j) {
+                        #Store the model
+                        model <- model_bin[[j]]$Model
+                        
+                        #Grab the features
+                        features <- model$features
+                        
+                        #Grab the type
+                        type <- model$task.desc$type
+                        
+                        #Make a copy of the data
+                        df_copy <- 
+                          df %>%
+                          #Grab only the required features
+                          dplyr::select(one_of(c(var, features)))
+                        
+                        #Rename the first column
+                        colnames(df_copy)[1] <- 'target'
+                        
+                        #Transform into a task
+                        df_task <- if(type == 'classif') {
+                          makeClassifTask(data = df_copy,
+                                          target = 'target')
+                        } else {
+                          makeRegrTask(data = df_copy,
+                                       target = 'target')
+                        }
+                        
+                        #Make predictions from the model
+                        preds <-
+                          if(type == 'regr') {
+                            predict(model, df_task)$data$response } else {
+                              predict(model, df_task)$data[, paste0('prob.', pos_classes[i])]
+                            }
+                        
+                        #Make into a data frame
+                        preds <- data.frame(preds)
+                        colnames(preds) <- paste0('M', j)
+                        preds
+                      }))
+            
+            #Average each column
+            preds <- data.frame(do.call("c", lapply(1:nrow(tgbtg), function(j) {
+              mean(as.numeric(tgbtg[j,]))
+            })))
+            
+            #Rename column
+            colnames(preds) <- paste0(x_vars[i], '_Continuous_Prediction')
+            
+            #Output
+            preds
+          }))
+
+df <-
+  cbind.data.frame(df, continuous_layer_df) %>%
+  mutate(OUC_Continuous_Binary_Response = ifelse((Over_Under_Coverage_Continuous_Prediction - OVER_UNDER) > 0, 'over', 'under'),
+         SC_Continuous_Binary_Response = ifelse((Spread_Coverage_Continuous_Prediction + SPREAD) > 0, 'covered', 'loss'))
+
+#################################
+# Combine and output
+#################################
+
+#Read in the train test split
+train_test_split <- 
+  read.csv('H:/train_test.csv') %>%
+  filter(TEST == 1) %>%
+  mutate(id = paste(Season, Week, sep = '_')) %>%
+  .$id %>%
+  as.character
+
+df <-
+  df %>%
+  mutate(Set = ifelse(Season > 2018, 'Test', ifelse(paste(Season, Week, sep = '_') %in% train_test_split, 'Test', 'Train'))) %>%
+  dplyr::select(Season, Week, Set, Home_Team, Away_Team, Total_Points, Total_Points_Alwd, Point_Differential, Game_Total_Points, Win_Loss, SPREAD, OVER_UNDER,
+                Spread_Coverage, Over_Under_Coverage, Over_Under_Coverage_Classification_Prediction, Over_Under_Coverage_Continuous_Prediction, OUC_Classification_Binary_Response,
+                OUC_Continuous_Binary_Response, Spread_Coverage_Classification_Prediction, Spread_Coverage_Continuous_Prediction, SC_Classification_Binary_Response, SC_Continuous_Binary_Response)
+
+#################################
+# Store Results
+#################################
+
+#Establish connection with the table
+con <-
+  mongo(
+    collection = "NFL",
+    db = 'HISTORICAL_RESULTS',
+    url = "mongodb+srv://thatsmrlongcut:football17@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority"
+  )
+
+con$drop()
+con$insert(df)
+rm(con)
+
+con <- 
+  mongo(
+  collection = "Collection0",
+  db = 'HISTORICAL_RESULTS',
+  url = 'mongodb+srv://thatsmrlongcut:football17@cluster0-ttntc.mongodb.net/test'
+)
+
+con$drop()
+con$insert(df)
+rm(con)
+
+rm(list=ls())
