@@ -1,0 +1,1065 @@
+#Run the script that loads the functions & Packages
+source('H:/NFL_v2/Scripts/Package_Import.R')
+source('H:/NFL_v2/Scripts/Statistical_Functions.R')
+
+#################################
+# Import/assign data from mongo
+#################################
+
+username <- 'thatsmrlongcut'
+password <- 'football17'
+
+#Establish the tables to be imported from mongodb
+import_df <- 
+  data.frame(mongo_name = c('PFR_MISC_STATS', 'PFR_GAME_STATS', 'PFR_PLAYER_STATS', 'PFR_STARTERS', 'FO_DVOA', 'PFF_GRADES', 'NFL_SEASON',
+                                       'POSITION_MAPPING', 'MATCHUPS', 'PFF_FIRST_TIME_GRADES', 'PFR_FIRST_TIME_QBS'),
+                        object_name = c('misc_info', 'game_stats', 'player_stats', 'starters', 'dvoa', 'grades', 'nfl_season', 'position_mapping', 
+                                        'matchups', 'first_time_starters', 'first_timers'),
+                        stringsAsFactors = FALSE)
+
+#Run a loop and import/assign
+for(i in 1:nrow(import_df)) {
+  #Establish connection with mongo db
+  con <-
+    mongo(
+      collection = "NFL",
+      db = import_df$mongo_name[i],
+      url = paste0("mongodb+srv://thatsmrlongcut:football17@nfl-bsxce.mongodb.net/")
+    )
+  #Assign object
+  assign(import_df$object_name[i], con$find(), envir = .GlobalEnv)
+  rm(con)
+}
+
+#################################
+# Structure a matchups table to merge all information into
+#################################
+
+# #Set the home team/away team identifier
+# ha_ids <- c("Home_Team", "Away_Team")
+# 
+# matchups <-
+#   do.call("rbind", lapply(1:length(ha_ids), function(i) {
+#     misc_info %>%
+#       dplyr::select(one_of(c('Season', 'Week', 'Home_Team', 'Away_Team', "OVER_UNDER", "SPREAD", "FAVORITE", 'Game_Date_Time'))) %>%
+#       setNames(gsub(ha_ids[i], "Team", names(.))) %>%
+#       setNames(gsub(ha_ids[-i], "Opponent", names(.))) %>%
+#       mutate(FAVORITE = ifelse(is.na(FAVORITE), 0.5, ifelse(Team == FAVORITE, 1, 0)),
+#              SPREAD = ifelse(FAVORITE == 0.5, 0, ifelse(FAVORITE == 1, -1*SPREAD, SPREAD)))
+#   })) %>%
+#   filter(Season > 1990,
+#          Week < 18)
+
+
+#Grab the necessary information from the miscellaneous table and merge with matchups
+matchups <-
+matchups %>%
+  mutate(game_id = ifelse(Home_Away == 'Home', paste(Team, Opponent, Season, Week, sep = '_'),
+                          paste(Opponent, Team, Season, Week, sep = '_'))) %>%
+  left_join(misc_info %>%
+              dplyr::select(game_id = Home_Away_Season_Week, OVER_UNDER, SPREAD, FAVORITE),
+            by = 'game_id') %>%
+  mutate(FAVORITE = ifelse(is.na(FAVORITE), 0.5, ifelse(Team == FAVORITE, 1, 0)),
+         SPREAD = ifelse(FAVORITE == 0.5, 0, ifelse(FAVORITE == 1, -1*SPREAD, SPREAD)))
+
+#Identify the current week by looking at the first week the NULLs start to appear in the data
+current_week <-
+  matchups %>%
+  group_by(Season, Week) %>%
+  summarise(null_cnt = sum(is.na(OVER_UNDER))) %>%
+  filter(null_cnt > 10) %>% #Arbitrary number to avoid 1 possible null fucking this up
+  summarise_all(first)
+
+#################################
+# Merge game stats with the matchups table #
+#################################
+
+game_info <-
+  matchups %>%
+  left_join(game_stats %>%
+              dplyr::select(-one_of('Home_Away')),
+            by = c('Season', 'Week', 'Team')) %>%
+  mutate(Point_Differential = Total_Points - Total_Points_Alwd,
+         Point_Differential_Q1 = Q1_Points - Q1_Points_Alwd,
+         Point_Differential_Q2 = Q2_Points - Q2_Points_Alwd,
+         Point_Differential_Q3 = Q3_Points - Q3_Points_Alwd,
+         Point_Differential_Q4 = Q4_Points - Q4_Points_Alwd,
+         Game_Total_Points = Total_Points + Total_Points_Alwd,
+         TOT_PLYS = PASS_ATT + RUSH_ATT + SCK + PEN,
+         TOT_PLYS_Alwd = PASS_ATT_Alwd + RUSH_ATT_Alwd + SCK_Alwd + PEN_Alwd,
+         NPYDS_MOD = (PASS_YDS + (20 * PASS_TDS) - (45 * PASS_INT)),
+         NPYDS_MOD_Alwd = (PASS_YDS_Alwd + (20 * PASS_TDS_Alwd) - (45 * PASS_INT_Alwd)),
+         NPYDS = (PASS_YDS - SCK_YDS),
+         NPATT = (PASS_ATT + SCK),
+         NPYDS_Alwd = (PASS_YDS_Alwd - SCK_YDS_Alwd),
+         NPATT_Alwd = (PASS_ATT_Alwd + SCK_Alwd),
+         MULTIPLIER = 60/(TOP + TOP_Alwd),
+         Win_Loss = ifelse(Point_Differential > 0, 'win', ifelse(Point_Differential == 0, 'tie', 'loss')),
+         Spread_Differential = Point_Differential + SPREAD,
+         Spread_Coverage = as.factor(ifelse(Spread_Differential > 0, 'covered', ifelse(Spread_Differential == 0, 'push', 'loss'))),
+         Over_Under_Differential = Game_Total_Points - OVER_UNDER,
+         Over_Under_Coverage = ifelse(Over_Under_Differential > 0, 'over', ifelse(Over_Under_Differential == 0, 'push', 'under')),
+         Expected_Points = ifelse(FAVORITE == 1, OVER_UNDER - ((OVER_UNDER  + SPREAD)/2), ifelse(FAVORITE == 0, (OVER_UNDER - SPREAD)/2, OVER_UNDER/2)),
+         Expected_Points_Alwd = OVER_UNDER - Expected_Points,
+         Spread_Pct_Over_Under = abs(SPREAD)/OVER_UNDER) %>%
+  arrange(Season, Week)
+
+#################################
+# Trailing Stat Creation #
+#################################
+
+### League Efficiency Comparison Metrics ###
+
+#Numerators
+numerators <- c("Total_Points", "TO",  "TYDS", "FDS", "RUSH_YDS", "RUSH_TDS", 
+                "PASS_TDS", "PASS_CMP", "PASS_INT", "PASS_YDS", "NPYDS_MOD", "NPYDS",
+                "PEN_YDS", "PEN", "SCK", "TYDS", "TOT_PLYS", "TOT_PLYS",
+                "Total_Points", "Total_Points", "THRD_CONV", "THRD_ATT", "Total_Points")
+#Denominators
+denominators <- c("TOT_PLYS", "TOT_PLYS", "TOT_PLYS", "TOT_PLYS", "RUSH_ATT", "RUSH_ATT", 
+                  "PASS_ATT", "PASS_ATT", "PASS_ATT", "PASS_ATT", "NPATT", "NPATT", "TOT_PLYS",
+                  "TOT_PLYS", "PASS_ATT", "FDS", "TOP", "FDS",
+                  "FDS", "TOP", "THRD_ATT", "FDS", "TOP")
+#Names
+names <- c("PTs", "TOs", "YDs", "FDs", "RYDs", "RTDs", 
+           "PTDs", "PCMPs", "PINTs", "PYDs", "MNPYDs", "NPYDs",
+           "PENYDs", "TPEN", "SCKs", "TYDS_FDS", "TOT_PLYS_MIN", "TOT_PLYS_FDS",
+           "PTs_FDS", "PTs_TOP", "THRD_Pct", "THRD_FDS", "PTS_MIN")
+
+#Combine everything with "_Alwd"
+numerators <- c(numerators, paste0(numerators, "_Alwd"))
+denominators <- c(denominators, paste0(denominators, "_Alwd"))
+names <- c(names, paste0(names, "_Alwd"))
+
+#Grab league efficiency comparisons
+comparisons <- Reduce(merge,
+                      lapply(1:length(names), function(x) {
+                        league_efficiency_comparison(game_info, 
+                                                     numerators[x], 
+                                                     denominators[x], 
+                                                     "MULTIPLIER", 12, 
+                                                     names[x])}))
+
+### Point Differential Rating System ###
+
+#Grab simple rating system for point differential
+pdifs <- 'Point_Differential'
+pdifs <- c(pdifs, paste0(pdifs, '_Q', seq(1:4)))
+
+srs <- Reduce(merge, lapply(1:length(pdifs), function(i) {
+  strSch_function(game_info, pdifs[i], 12)
+}))
+
+### Variable Greater than Opponents Trailing Streaks ###
+
+#Greater than opponent streak vars
+gt_opp_vars <- c("Q1_Points", "Q2_Points", "Q3_Points", "Q4_Points",
+                 "Total_Points", "FDS", "NPYDS", "TYDS", "TO", "TOP",
+                 "RUSH_ATT", "RUSH_YDS", "RUSH_TDS", "PASS_CMP", 
+                 "PASS_ATT", "PASS_YDS", "PASS_TDS", "SCK", "PEN",
+                 "PEN_YDS")
+
+#Greater than opponent streaks
+gt_opp_streaks <- streak_function(game_info, gt_opp_vars)
+
+### Alternate Trailing Streaks ###
+
+#Times they have covered the spread, hit the over
+alt_vars <- c('Spread_Coverage', 'Over_Under_Coverage')
+alt_pos <- c('covered', 'over')
+
+alt_streaks <-
+  Reduce(merge, 
+         lapply(1:length(alt_vars), function(i) {
+           alternate_streak_function(game_info, alt_vars[i], alt_pos[i])
+         }))
+
+### Cumulative DVOA Lagged 1 Week ###
+
+#Establish the variables to shift by 1 week for each team
+dvoa_vars <- colnames(dvoa)[grepl('DVOA', colnames(dvoa))]
+
+#Shift everything by 1 week for each team
+dvoa_shift <- Reduce(merge,
+                    lapply(1:length(dvoa_vars), function(x) {
+                      shift_one_week(dvoa_vars[x], dvoa %>%
+                                       filter(Week < 18,
+                                              Season > 1990))
+                    }))
+
+#################################
+# Trailing Stat Structuring #
+#################################
+
+#Merge everything
+trailing_features <- 
+  Reduce(merge,
+         list(comparisons,
+              srs,
+              gt_opp_streaks,
+              alt_streaks)) %>%
+  left_join(dvoa_shift,
+            by = c('Team', 'Season', 'Week'))
+
+#Find the start row of the current week
+st <- match(paste(current_week$Season, current_week$Week, sep = '_'),
+      paste(trailing_features$Season, trailing_features$Week, sep = '_'))
+
+#Current Week data frame construction and removal
+current_week_df <- 
+  trailing_features[st:nrow(trailing_features),] %>%
+  filter(Week == current_week$Week) %>%
+  dplyr::select(-one_of(dvoa_vars)) %>%
+  left_join(
+    dvoa %>%
+      arrange(Season, Week) %>%
+      group_by(Team) %>%
+      summarise_at(dvoa_vars, dplyr::last),
+    by = 'Team'
+  )
+
+#Remove it
+trailing_features <- trailing_features[-(st:nrow(trailing_features)),]
+
+#Vars to keep from game info data frame
+keep_vars <- c("Season", "Week", "Team", "Opponent", "Total_Points", "Total_Points_Alwd", "Point_Differential", "Home_Away",
+               "Expected_Points", "Expected_Points_Alwd", "Spread_Coverage", "Over_Under_Coverage", "Win_Loss", "Spread_Differential", "OVER_UNDER", 
+               "Over_Under_Differential", "Win_Loss", "FAVORITE", "SPREAD", "Game_Total_Points", "Spread_Pct_Over_Under")
+
+#Merge back with the game info data frame, keeping only the old variables above
+working_df <- 
+  game_info %>%
+  dplyr::select(one_of(keep_vars)) %>%
+  left_join(trailing_features,
+            by = c("Season", "Week", "Team")) %>%
+  arrange(Season, Week)
+
+#################################
+# ~ Condense back to the Matchup Level ~ #
+#################################
+
+#Variables that are to be kept from the working data frame
+game_vars <- keep_vars[!(keep_vars %in% c('Home_Away', 'Opponent'))]
+
+#Create the new table which is a merge between the matchups and the working data frame
+comb_df <- 
+  misc_info %>%
+  filter(Season > 1991,
+         Week < 18) %>%
+  dplyr::select(Season, Week, Home_Team, Away_Team) %>%
+  arrange(Season, Week) %>%
+  mutate(Team = Home_Team) %>%
+  left_join(working_df %>%
+              dplyr::select(one_of(game_vars)),
+            by = c("Season", "Week", "Team")) %>%
+  dplyr::select(-one_of("Team")) %>%
+  mutate(ht_id = paste(Season, Week, Home_Team, sep = '_'),
+         at_id = paste(Season, Week, Away_Team, sep = '_'))
+
+#Grab all of the Home Team/Away Team's trailing stats from the working data frame and merge with the combined data frame
+ha_ids <- c("ht_id", "at_id")
+ha_names <- c("Home_Team_", "Away_Team_")
+for(i in 1:length(ha_ids)) {
+  comb_df <- cbind.data.frame(
+    comb_df,
+    working_df[match(comb_df[,ha_ids[i]], paste(working_df$Season, working_df$Week, working_df$Team, sep = '_')),] %>%
+      dplyr::select(-one_of(c('Season', 'Week', 'Team', keep_vars))) %>%
+      setNames(paste0(ha_names[i], names(.)))
+  )
+}
+
+#################################
+# ~ Player Grades ~ #
+#################################
+
+#Create a list of the two data frames in context
+grades <- 
+  grades %>%
+  arrange(season, week) %>%
+  filter(!is.na(position)) %>%
+  mutate(game_id = paste(season, week, team, sep = '_'),
+         position = position_mapping$New_Position[match(position, position_mapping$Old_Position)]) %>%
+  dplyr::select(Season = season, Week = week, Team = team, game_id, player, player_id, position,  status, grade, snapcount = snap_count)
+
+#For breaking of ties -- grab each player's primary position
+primary_position <-
+  grades %>%
+  group_by(player_id, position) %>%
+  summarise(total_snaps = sum(snapcount)) %>%
+  group_by(player_id) %>%
+  top_n(1, total_snaps) %>%
+  group_by(player_id) %>%
+  summarise_all(first) %>%
+  as.data.frame
+
+#Pro Football Focus grades every snap -- even if Tom Brady aligns as a wide receiver
+#To get around this -- just grab the position/observation they played the most snaps at
+#That game -- tie break goes to their primary position
+grades <- 
+  grades %>%
+  group_by(Season, Week, Team, player, player_id) %>%
+  top_n(1, snapcount) %>%
+  as.data.frame %>%
+  mutate(prime_pos = ifelse(position == primary_position$position[match(player_id, primary_position$player_id)], 1, 0)) %>%
+  group_by(Season, Week, Team, player, player_id) %>%
+  arrange(desc(prime_pos)) %>%
+  summarise_all(first) %>%
+  as.data.frame %>%
+  dplyr::select(-one_of('prime_pos'))
+
+#Grab the averages -- split again (yes i know its inefficient too lazy to change the procedure)
+player_spl <- 
+  grades %>%
+  split(.$player_id)
+
+#Run the rolling weighted mean over every player
+grades <-
+  do.call("rbind",
+          lapply(1:length(player_spl), function(u) {
+            player_spl[[u]] <- player_spl[[u]] %>%
+              arrange(Season, Week) %>%
+              mutate(total_snaps = cumsum(snapcount))
+            
+            player_spl[[u]]$weighted_grade <-
+              do.call("c", lapply(1:nrow(player_spl[[u]]), function(x) {
+                w1 <- player_spl[[u]]$snapcount[1:x]/player_spl[[u]]$total_snaps[x]
+                w2 <- player_spl[[u]]$grade[1:x]
+                sum(w1*w2)
+              }))
+            
+            player_spl[[u]] %>%
+              arrange(Season, Week) %>%
+              mutate(weighted_grade = shift(weighted_grade),
+                     total_snaps = shift(total_snaps),
+                     player_game_id = paste(game_id, player_id, sep = '_'),
+                     player_season_team = paste(player, Season, Team))
+          }))
+
+#Grab the average grades by position for first time starters to back fill
+# first_time_starters <- 
+#   grades %>%
+#   filter(Season > 2008,
+#          status == 'S',
+#          is.na(weighted_grade)) %>%
+#   group_by(position) %>%
+#   summarise(avg_first = mean(grade, na.rm = TRUE)) %>%
+#   as.data.frame
+
+#################################
+#~ Compilation and Storing of Historical Values ~#
+#################################
+
+#For each player grab their total snapcount weighted grade
+total_grades <- 
+  do.call("rbind", lapply(1:length(player_spl), function(x) {
+  player_spl[[x]] %>%
+    summarise(
+      player = unique(player)[1],
+      player_id = unique(player_id)[1],
+      total_snaps = sum(snapcount),
+      weighted_grade = sum((snapcount/sum(snapcount)) * grade)
+    )
+})) %>%
+  mutate(position_primary = primary_position$position[match(player_id, primary_position$player_id)],
+         position_primary_total_snaps = primary_position$total_snaps[match(player_id, primary_position$player_id)],
+         percentage_total_snaps = position_primary_total_snaps/total_snaps)
+
+#Insert the first time grades into mongo
+#Establish connection with mongo db
+# con <-
+#   mongo(
+#     collection = "NFL",
+#     db = "PFF_FIRST_TIME_GRADES",
+#     url = paste0("mongodb+srv://", username, ":", password, '@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+#   )
+# con$drop()
+# con$insert(first_time_starters)
+# rm(con)
+
+#################################
+#~ Snapcount Weighted Average Grades ~ #
+#################################
+
+#Grab the full roster (agnostic of starter/sitter) weighted average grades
+full_grades <-
+  grades %>%
+  filter(position != 'FB') %>%
+  mutate(weighted_grade = ifelse(is.na(weighted_grade), 
+                                 first_time_starters$avg_first[match(position, first_time_starters$position)],
+                                 as.numeric(weighted_grade)),
+         total_snaps = ifelse(is.na(total_snaps), 1, as.numeric(total_snaps))) %>%
+  group_by(Season, Week, Team, position) %>%
+  mutate(snap_weight = total_snaps/sum(total_snaps)) %>%
+  summarise(sc_weighted_grade = sum(snap_weight * weighted_grade)) %>%
+  spread(position, sc_weighted_grade) %>%
+  melt(id.vars = c("Season", "Week", "Team"),
+       value.name = "sc_weighted_grade", variable.name = "position") %>%
+  mutate(id = paste(Season, Week, Team, position, sep = '_'))
+
+#Weighted average starter grades
+weighted_avg_starter_grades <-
+  do.call("rbind", 
+          grades %>%
+            filter(position != 'FB',
+                   status == 'S') %>%
+            mutate(weighted_grade = ifelse(is.na(weighted_grade), 
+                                           first_time_starters$avg_first[match(position, first_time_starters$position)],
+                                           as.numeric(weighted_grade)),
+                   total_snaps = ifelse(is.na(total_snaps), 1, as.numeric(total_snaps))) %>%
+            group_by(Season, Week, Team, position) %>%
+            mutate(snap_weight = total_snaps/sum(total_snaps)) %>%
+            summarise(sc_weighted_grade = sum(snap_weight * weighted_grade)) %>%
+            spread(position, sc_weighted_grade) %>%
+            melt(id.vars = c("Season", "Week", "Team"),
+                 value.name = "sc_weighted_grade", variable.name = "position") %>%
+            mutate(id = paste(Season, Week, Team, position, sep = '_'),
+                   sc_weighted_grade = ifelse(is.na(sc_weighted_grade),
+                                              full_grades$sc_weighted_grade[match(id, full_grades$id)],
+                                              as.numeric(sc_weighted_grade))) %>%
+            dplyr::select(-one_of('id')) %>%
+            spread(position, sc_weighted_grade, sep = '_') %>%
+            setNames(gsub("position", "grades", names(.))) %>%
+            as.data.frame %>%
+            filter(Season > 2007) %>%
+            mutate(week_id = paste(Season, Week, sep = '_')) %>%
+            split(.$week_id) %>%
+            map(~pProc(., drop_columns = c('Season', 'Week', 'Team', 'week_id')))
+  ) %>%
+  dplyr::select(-one_of('week_id'))
+
+#################################
+#~ Total Snapcount for Each Position ~#
+#################################
+
+#Grab total career snaps for each position agnostic of starter/sitter
+full_snaps <-
+  grades %>%
+  filter(position != 'FB') %>%
+  group_by(Season, Week, Team, position) %>%
+  summarise(tot_snaps = sum(total_snaps, na.rm = TRUE)) %>%
+  spread(position, tot_snaps) %>%
+  melt(id.vars = c("Season", "Week", "Team"),
+       value.name = "tot_snaps", variable.name = "position") %>%
+  mutate(id = paste(Season, Week, Team, position, sep = '_'))
+
+#Starter total snapcounts
+starter_total_snaps <-
+  do.call("rbind", 
+          grades %>%
+            filter(position != 'FB',
+                   status == "S") %>%
+            group_by(Season, Week, Team, position) %>%
+            summarise(tot_snaps = sum(total_snaps, na.rm = TRUE)) %>%
+            spread(position, tot_snaps) %>%
+            melt(id.vars = c("Season", "Week", "Team"),
+                 value.name = "tot_snaps", variable.name = "position") %>%
+            mutate(id = paste(Season, Week, Team, position, sep = '_'),
+                   tot_snaps = ifelse(is.na(tot_snaps),
+                                      full_snaps$tot_snaps[match(id, full_snaps$id)],
+                                      as.numeric(tot_snaps))) %>%
+            dplyr::select(-one_of('id')) %>%
+            spread(position, tot_snaps, sep = '_') %>%
+            setNames(gsub("position", "snaps", names(.))) %>%
+            as.data.frame %>%
+            filter(Season > 2007) %>%
+            mutate(week_id = paste(Season, Week, sep = '_')) %>%
+            split(.$week_id) %>%
+            map(~pProc(., drop_columns = c('Season', 'Week', 'Team', 'week_id')))
+  ) %>%
+  dplyr::select(-one_of('week_id'))
+
+#################################
+#~ Total Starter Weighted Grade/Snapcount ~
+#################################
+
+#Total weighted starter roster grade and snapcount
+starters_compiled <-
+  do.call("rbind", 
+          grades %>%
+            filter(!is.na(weighted_grade),
+                   status == "S") %>%
+            group_by(Season, Week, Team) %>%
+            mutate(snap_weight = total_snaps/sum(total_snaps)) %>%
+            summarise(team_sc_weighted_grade = sum(snap_weight * weighted_grade),
+                      team_total_snaps = sum(total_snaps, na.rm = TRUE)) %>%
+            as.data.frame %>%
+            filter(Season > 2007) %>%
+            mutate(week_id = paste(Season, Week, sep = '_')) %>%
+            split(.$week_id) %>%
+            map(~pProc(., drop_columns = c('Season', 'Week', 'Team', 'week_id')))
+  ) %>%
+  dplyr::select(-one_of('week_id'))
+
+#################################
+# ~ Merge player information with the dataframe ~ #
+#################################
+
+#Merge all the information together to get the player grade data frame
+player_grades <-
+  weighted_avg_starter_grades %>%
+  left_join(starter_total_snaps,
+            by = c("Season", "Week", "Team")) %>%
+  left_join(starters_compiled,
+            by = c("Season", "Week", "Team")) %>%
+  mutate(game_id = paste(Season, Week, Team, sep = '_'))
+
+#Set the keys for the comb df
+ha_ids <- c("Home_Team", "Away_Team")
+#Set the drop columns
+drop_vars <- c("Season", "Week", "Team", "game_id")
+
+for(i in 1:length(ha_ids)) {
+  comb_df <- cbind.data.frame(comb_df, 
+                              player_grades[match(paste(comb_df$Season, comb_df$Week, comb_df[, ha_ids[i]], sep = '_'), player_grades$game_id),] %>%
+                                dplyr::select(-one_of(drop_vars)) %>%
+                                setNames(paste0(ha_names[i], names(.)))
+  )
+}
+
+#################################
+# ~ Grab the NFL League Wide Passer Stats ~ #
+#################################
+
+#Grab the stat variables used
+stat_cols <- c("PASS_RATE", "CPA", "YPA", "TDPA", "IPA")
+summ_cols <- c("PASS_ATT", "PASS_CMP", "PASS_YDS", "PASS_TDS", "PASS_INT")
+
+#Grab the league wide 'passer' stats for each game by player
+player_passer_stats <- 
+  player_stats %>%
+  dplyr::select(one_of(c('Team', 'Season', 'Week', 'player', 
+                         colnames(player_stats)[grepl("PASS", colnames(player_stats))]))) %>%
+  group_by(Team, Season, Week, player) %>%
+  summarise_all(first) %>%
+  as.data.frame %>%
+  filter(is.na(PASS_RATE) == FALSE) %>%
+  dplyr::select(-one_of(c('PASS_LNG', 'PASS_RATE'))) %>%
+  as.data.frame %>%
+  arrange(Season, Week)
+
+#Grab the team summarized passing stats for each game
+team_passing_stats <- 
+  matchups %>%
+  dplyr::select(-one_of('SPREAD', 'OVER_UNDER', 'FAVORITE', 'game_id', 'Home_Away')) %>%
+  left_join(player_passer_stats %>%
+              dplyr::select(-one_of('player')) %>%
+              group_by(Team, Season, Week) %>%
+              summarise_all(sum, na.rm = TRUE) %>%
+              as.data.frame,
+            by = c("Season", "Week", "Team"))
+
+#Compute the league total passing stats on a trailing 16 game basis
+nfl_league_avg_pass_stats <-
+  team_passing_stats %>%
+  dplyr::select(-one_of(c('Opponent', 'Team'))) %>%
+  group_by(Season, Week) %>%
+  summarise_all(sum, na.rm = TRUE) %>%
+  as.data.frame %>%
+  arrange(Season, Week) %>%
+  mutate_at(c("PASS_CMP", "PASS_ATT", "PASS_YDS", "PASS_TDS", "PASS_INT",
+              "PASS_SCK", "PASS_SCK_YDS"), roll_sum, n = 16, align = "right", fill = NA)  %>%
+  rowwise() %>%
+  mutate(PASS_RATE = passer_rating(PASS_CMP, PASS_ATT, PASS_YDS, PASS_TDS, PASS_INT)) %>%
+  as.data.frame %>%
+  arrange(Season, Week) %>% 
+  mutate(CPA = PASS_CMP/PASS_ATT,
+         YPA = PASS_YDS/PASS_ATT,
+         TDPA = PASS_TDS/PASS_ATT,
+         IPA = PASS_INT/PASS_ATT) %>%
+  mutate_at(stat_cols, shift) %>%
+  dplyr::select(Season, Week, PASS_RATE, CPA, YPA, TDPA, IPA)
+
+colnames(nfl_league_avg_pass_stats)[-(1:2)] <- paste0("nfl_", colnames(nfl_league_avg_pass_stats)[-(1:2)])
+
+#Grab the passing stats allowed by each team for each game
+team_passing_allowed <- 
+  team_passing_stats %>%
+  arrange(Season, Week) %>%
+  group_by(Opponent) %>%
+  mutate_at(summ_cols, shift) %>%
+  mutate_at(summ_cols, roll_sum, n = 8, align = "right", fill = NA, na.rm = TRUE) %>%
+  mutate(CPA = PASS_CMP/PASS_ATT,
+         YPA = PASS_YDS/PASS_ATT,
+         TDPA = PASS_TDS/PASS_ATT,
+         IPA = PASS_INT/PASS_ATT)  %>%
+  rowwise() %>%
+  mutate(PASS_RATE = passer_rating(PASS_CMP, PASS_ATT, PASS_YDS, PASS_TDS, PASS_INT)) %>%
+  as.data.frame %>%
+  arrange(Season, Week)
+
+colnames(team_passing_allowed)[-(1:4)] <- paste0("opp_", colnames(team_passing_allowed)[-(1:4)])
+
+#################################
+# ~ Structure the eligible Passers to be iterated through ~ #
+#################################
+
+#Grab the eligible passers
+eligible_passers <-
+  player_passer_stats %>%
+  as.data.frame %>%
+  rowwise() %>%
+  mutate(PASS_RATE = passer_rating(PASS_CMP, PASS_ATT, PASS_YDS, PASS_TDS, PASS_INT)) %>%
+  left_join(matchups %>%
+              dplyr::select(-one_of('SPREAD', 'OVER_UNDER', 'FAVORITE',  'game_id', 'Home_Away')),
+            by = c("Season", "Week", "Team")) %>%
+  arrange(Season, Week) %>%
+  as.data.frame %>%
+  filter(PASS_ATT > 0,
+         Season > 1990,
+         !is.na(Opponent))
+
+#################################
+# ~ Iterate through each Eligible Passer and Compute Trailing Stats ~ #
+#################################
+
+passers <- unique(eligible_passers$player)
+
+trail_passer_stats <- 
+  do.call("rbind",
+          lapply(1:length(passers), function(z) {
+            
+            #Merge the eligible passer with the opponent/league average tables
+            merged_tables <-
+              eligible_passers %>%
+              as.data.frame %>%
+              filter(player == as.character(passers[z])) %>%
+              left_join(nfl_league_avg_pass_stats,
+                        by = c("Season", "Week")) %>%
+              left_join(team_passing_allowed %>%
+                          dplyr::select(one_of(c("Opponent", "Season", "Week",
+                                                 paste0("opp_", stat_cols)))),
+                        by = c("Season", "Week", "Opponent")) %>%
+              mutate(CPA = PASS_CMP/PASS_ATT,
+                     YPA = PASS_YDS/PASS_ATT,
+                     TDPA = PASS_TDS/PASS_ATT,
+                     IPA = PASS_INT/PASS_ATT) %>%
+              mutate_at(summ_cols, list(CumSum = ~cumsum(.))) %>%
+              mutate(CPA_CumSum = PASS_CMP_CumSum/PASS_ATT_CumSum,
+                     YPA_CumSum = PASS_YDS_CumSum/PASS_ATT_CumSum,
+                     TDPA_CumSum = PASS_TDS_CumSum/PASS_ATT_CumSum,
+                     IPA_CumSum = PASS_INT_CumSum/PASS_ATT_CumSum) %>%
+              as.data.frame %>%
+              rowwise() %>%
+              mutate(PASS_RATE_CumSum = passer_rating(PASS_CMP_CumSum, PASS_ATT_CumSum,
+                                                        PASS_YDS_CumSum, PASS_TDS_CumSum, PASS_INT_CumSum)) %>%
+              as.data.frame
+            
+            #Define the variables to compute percentage differences
+            qb_vars <- c("CPA", "YPA", "TDPA", "IPA", "PASS_RATE")
+            comp_vars <- c("nfl_", "opp_")
+            
+            iter_vars <- 
+              lapply(1:length(comp_vars), function(x) {
+                qb_cols <- qb_vars
+                comp_cols <- paste0(comp_vars[x], qb_vars)
+                #Add the cumulative stats to the nfl
+                if(comp_vars[x] == "nfl_") {
+                  qb_cols <- c(qb_cols, paste0(qb_cols, "_CumSum"))
+                  comp_cols <- c(comp_cols, comp_cols)
+                }
+                list(
+                  qb_cols,
+                  comp_cols
+                )
+              })
+            
+            #Extract the qb/comparison vars
+            qb_cols <- do.call("c", lapply(1:length(iter_vars), function(x) {
+              iter_vars[[x]][[1]]
+            }))
+            comp_cols <- do.call("c", lapply(1:length(iter_vars), function(x) {
+              iter_vars[[x]][[2]]
+            }))
+            
+            #Add in the opponent and nfl comparison
+            x_vars <- c(qb_cols, paste0("opp_", qb_vars))
+            y_vars <- c(comp_cols, paste0("nfl_", qb_vars))
+            
+            #Create the differences
+            pct_dif_table <-
+              do.call("cbind.data.frame", lapply(1:length(x_vars), function(x) {
+                #Compute the percentage difference
+                pctdif <- (merged_tables[,x_vars[x]] - merged_tables[,y_vars[x]])/merged_tables[,y_vars[x]]
+                #If it is NaN/Inf/NA replace with the mean
+                #Find infinites
+                infinites <- which(is.infinite(pctdif) | is.nan(pctdif))
+                #Cap small values
+                pctdif[which((pctdif < -1) & (pctdif > -100))] <- -1
+                pctdif[which((pctdif > 2) & (pctdif < 1000))] <- 2
+                #Extract mean
+                avg <- if(length(infinites) > 0) { mean(pctdif[-infinites], na.rm = TRUE) } else { mean(pctdif, na.rm = TRUE) }
+                #Inject avg back
+                pctdif[which(is.infinite(pctdif) | is.nan(pctdif) | is.na(pctdif))] <- avg
+                #Transform into data frame
+                pctdif <- data.frame(pctdif)
+                colnames(pctdif) <- paste('pctDif', x_vars[x], y_vars[x], sep = '_')
+                pctdif
+              }))
+            
+            #Now perform a pass attempt weighted average of the relative performance of QB to OPP/NFL
+            vars <- paste('pctDif', qb_cols, comp_cols, sep = '_')
+            pa <- merged_tables$PASS_ATT
+            cumsumpa <- cumsum(pa)
+            
+            trail_pct_dif_avg <- 
+              do.call("cbind.data.frame", lapply(1:length(vars), function(x) {
+                mtch_var <- match(vars[x], colnames(pct_dif_table))
+                shift(do.call("c", lapply(1:nrow(pct_dif_table), function(k) {
+                  w1 <- pa[1:k]/cumsumpa[k]
+                  w2 <- pct_dif_table[1:k, mtch_var]
+                  sum(w1*w2)
+                })))
+              }))
+            colnames(trail_pct_dif_avg) <- vars
+            
+            #Add back in the opponent vs nfl (needed no trailing cumulative average)
+            cbind.data.frame(
+              merged_tables %>%
+                mutate(game_num = row_number()) %>%
+                dplyr::select(Team, Season, Week, player, game_num),
+              trail_pct_dif_avg,
+              pct_dif_table[,!(colnames(pct_dif_table) %in% colnames(trail_pct_dif_avg))]
+            )
+          }))
+
+#################################
+# ~ Construct the Data Frame for the Current Week! ~ #
+#################################
+
+#Compute the total stats for each passer
+cur_passer_stats <-
+  do.call("rbind", 
+          lapply(1:length(passers), function(z) {
+            merged_tables <-
+              eligible_passers %>%
+              as.data.frame %>%
+              filter(player == as.character(passers[z])) %>%
+              left_join(nfl_league_avg_pass_stats,
+                        by = c("Season", "Week")) %>%
+              left_join(team_passing_allowed %>%
+                          dplyr::select(one_of(c("Opponent", "Season", "Week",
+                                                 paste0("opp_", stat_cols)))),
+                        by = c("Season", "Week", "Opponent")) %>%
+              mutate(CPA = PASS_CMP/PASS_ATT,
+                     YPA = PASS_YDS/PASS_ATT,
+                     TDPA = PASS_TDS/PASS_ATT,
+                     IPA = PASS_INT/PASS_ATT) %>%
+              mutate_at(summ_cols, list(CumSum = ~cumsum(.))) %>%
+              mutate(CPA_CumSum = PASS_CMP_CumSum/PASS_ATT_CumSum,
+                     YPA_CumSum = PASS_YDS_CumSum/PASS_ATT_CumSum,
+                     TDPA_CumSum = PASS_TDS_CumSum/PASS_ATT_CumSum,
+                     IPA_CumSum = PASS_INT_CumSum/PASS_ATT_CumSum) %>%
+              as.data.frame %>%
+              rowwise() %>%
+              mutate(PASS_RATE_CumSum = passer_rating(PASS_CMP_CumSum, PASS_ATT_CumSum,
+                                                      PASS_YDS_CumSum, PASS_TDS_CumSum, PASS_INT_CumSum)) %>%
+              as.data.frame
+            
+            #Define the variables to compute percentage differences
+            qb_vars <- c("CPA", "YPA", "TDPA", "IPA", "PASS_RATE")
+            comp_vars <- c("nfl_", "opp_")
+            
+            iter_vars <- 
+              lapply(1:length(comp_vars), function(x) {
+                qb_cols <- qb_vars
+                comp_cols <- paste0(comp_vars[x], qb_vars)
+                #Add the cumulative stats to the nfl
+                if(comp_vars[x] == "nfl_") {
+                  qb_cols <- c(qb_cols, paste0(qb_cols, "_CumSum"))
+                  comp_cols <- c(comp_cols, comp_cols)
+                }
+                list(
+                  qb_cols,
+                  comp_cols
+                )
+              })
+            
+            #Extract the qb/comparison vars
+            qb_cols <- do.call("c", lapply(1:length(iter_vars), function(x) {
+              iter_vars[[x]][[1]]
+            }))
+            comp_cols <- do.call("c", lapply(1:length(iter_vars), function(x) {
+              iter_vars[[x]][[2]]
+            }))
+            
+            #Add in the opponent and nfl comparison
+            x_vars <- c(qb_cols, paste0("opp_", qb_vars))
+            y_vars <- c(comp_cols, paste0("nfl_", qb_vars))
+            
+            #Create the differences
+            pct_dif_table <-
+              do.call("cbind.data.frame", lapply(1:length(x_vars), function(x) {
+                #Compute the percentage difference
+                pctdif <- (merged_tables[,x_vars[x]] - merged_tables[,y_vars[x]])/merged_tables[,y_vars[x]]
+                #If it is NaN/Inf/NA replace with the mean
+                #Find infinites
+                infinites <- which(is.infinite(pctdif) | is.nan(pctdif))
+                #Cap small values
+                pctdif[which((pctdif < -1) & (pctdif > -100))] <- -1
+                pctdif[which((pctdif > 2) & (pctdif < 1000))] <- 2
+                #Extract mean
+                avg <- if(length(infinites) > 0) { mean(pctdif[-infinites], na.rm = TRUE) } else { mean(pctdif, na.rm = TRUE) }
+                #Inject avg back
+                pctdif[which(is.infinite(pctdif) | is.nan(pctdif) | is.na(pctdif))] <- avg
+                #Transform into data frame
+                pctdif <- data.frame(pctdif)
+                colnames(pctdif) <- paste('pctDif', x_vars[x], y_vars[x], sep = '_')
+                pctdif
+              }))         
+            
+            #Now perform a pass attempt weighted average of the relative performance of QB to OPP/NFL
+            vars <- paste('pctDif', qb_cols, comp_cols, sep = '_')
+            pa <- merged_tables$PASS_ATT
+            
+            #Weighted percent difference
+            tot_pct_dif <- do.call("cbind.data.frame", lapply(1:length(vars), function(x) {
+              sum(pa/sum(pa) * pct_dif_table[, vars[x]])
+            }))
+            colnames(tot_pct_dif) <- vars
+            
+            #Return the table with the player
+            tot_pct_dif %>%
+              mutate(player = passers[z],
+                     game_num = nrow(merged_tables))
+          }))
+
+#Grab the current nfl table for the given week
+nfl_cur <- 
+  nfl_league_avg_pass_stats %>%
+  filter(Week %in% current_week$Week,
+         Season %in% current_week$Season)
+
+#Grab the current opponent trailing stats (all teams)
+opp_cur <- 
+  team_passing_allowed %>%
+  filter(Week %in% current_week$Week,
+         Season %in% current_week$Season)
+
+#Grab the percent differences between opponent and NFL
+x_vars <- c('opp_CPA', 'opp_YPA', 'opp_TDPA', 'opp_IPA', 'opp_PASS_RATE')
+y_vars <- c('nfl_CPA', 'nfl_YPA', 'nfl_TDPA', 'nfl_IPA', 'nfl_PASS_RATE')
+
+opp_dif_cur <-
+  cbind.data.frame(opp_cur %>%
+                     dplyr::select(Season, Week, Team, Opponent),
+                   do.call("cbind.data.frame", 
+                           lapply(1:length(x_vars), function(x) {
+                             #Compute the percentage difference
+                             pctdif <- (opp_cur[,x_vars[x]] - nfl_cur[,y_vars[x]])/nfl_cur[,y_vars[x]]
+                             #If it is NaN/Inf/NA replace with the mean
+                             #Find infinites
+                             infinites <- which(is.infinite(pctdif) | is.nan(pctdif))
+                             #Cap small values
+                             pctdif[which((pctdif < -1) & (pctdif > -100))] <- -1
+                             pctdif[which((pctdif > 2) & (pctdif < 1000))] <- 2
+                             #Extract mean
+                             avg <- if(length(infinites) > 0) { mean(pctdif[-infinites], na.rm = TRUE) } else { mean(pctdif, na.rm = TRUE) }
+                             #Inject avg back
+                             pctdif[which(is.infinite(pctdif) | is.nan(pctdif) | is.na(pctdif))] <- avg
+                             #Transform into data frame
+                             pctdif <- data.frame(pctdif)
+                             colnames(pctdif) <- paste('pctDif', x_vars[x], y_vars[x], sep = '_')
+                             pctdif
+                           }))
+  )
+
+#################################
+# ~ Clean Up Starters -- prepare to merge ~ #
+#################################
+
+qb_starters <-
+  grades %>% 
+  filter(position == 'QB',
+         status == "S") %>%
+  dplyr::select(player, Season, Week, Team) %>% 
+  left_join(trail_passer_stats,
+            by = c("player", "Season", "Week", "Team")) %>%
+  mutate(game_id = paste(Season, Week, Team, sep = '_'))
+
+#################################
+# ~ Find the averages of first time rookies / players ~ #
+#################################
+
+#HORRIBLY INNEFICIENT CODE PLEASE CLEAN
+# 
+#Vars to identify the first time starter averages for
+miss_impute <- c(
+  "pctDif_CPA_nfl_CPA", "pctDif_YPA_nfl_YPA", "pctDif_TDPA_nfl_TDPA", "pctDif_IPA_nfl_IPA", "pctDif_PASS_RATE_nfl_PASS_RATE",
+  "pctDif_CPA_CumSum_nfl_CPA", "pctDif_YPA_CumSum_nfl_YPA", "pctDif_TDPA_CumSum_nfl_TDPA", "pctDif_IPA_CumSum_nfl_IPA",
+  "pctDif_PASS_RATE_CumSum_nfl_PASS_RATE", "pctDif_CPA_opp_CPA", "pctDif_YPA_opp_YPA", "pctDif_TDPA_opp_TDPA",
+  "pctDif_IPA_opp_IPA", "pctDif_PASS_RATE_opp_PASS_RATE"
+)
+# 
+# #Same code as previous just now it aint shifted
+# first_timers <- 
+#   do.call("rbind",
+#           lapply(1:length(passers), function(z) {
+#             
+#             #Merge the eligible passer with the opponent/league average tables
+#             merged_tables <-
+#               eligible_passers %>%
+#               as.data.frame %>%
+#               filter(player == as.character(passers[z])) %>%
+#               left_join(nfl_league_avg_pass_stats,
+#                         by = c("Season", "Week")) %>%
+#               left_join(team_passing_allowed %>%
+#                           dplyr::select(one_of(c("Opponent", "Season", "Week",
+#                                                  paste0("opp_", stat_cols)))),
+#                         by = c("Season", "Week", "Opponent")) %>%
+#               mutate(CPA = PASS_CMP/PASS_ATT,
+#                      YPA = PASS_YDS/PASS_ATT,
+#                      TDPA = PASS_TDS/PASS_ATT,
+#                      IPA = PASS_INT/PASS_ATT) %>%
+#               mutate_at(summ_cols, list(CumSum = ~cumsum(.))) %>%
+#               mutate(CPA_CumSum = PASS_CMP_CumSum/PASS_ATT_CumSum,
+#                      YPA_CumSum = PASS_YDS_CumSum/PASS_ATT_CumSum,
+#                      TDPA_CumSum = PASS_TDS_CumSum/PASS_ATT_CumSum,
+#                      IPA_CumSum = PASS_INT_CumSum/PASS_ATT_CumSum) %>%
+#               as.data.frame %>%
+#               rowwise() %>%
+#               mutate(PASS_RATE_CumSum = passer_rating(PASS_CMP_CumSum, PASS_ATT_CumSum,
+#                                                       PASS_YDS_CumSum, PASS_TDS_CumSum, PASS_INT_CumSum)) %>%
+#               as.data.frame
+#             
+#             #Define the variables to compute percentage differences
+#             qb_vars <- c("CPA", "YPA", "TDPA", "IPA", "PASS_RATE")
+#             comp_vars <- c("nfl_", "opp_")
+#             
+#             iter_vars <- 
+#               lapply(1:length(comp_vars), function(x) {
+#                 qb_cols <- qb_vars
+#                 comp_cols <- paste0(comp_vars[x], qb_vars)
+#                 #Add the cumulative stats to the nfl
+#                 if(comp_vars[x] == "nfl_") {
+#                   qb_cols <- c(qb_cols, paste0(qb_cols, "_CumSum"))
+#                   comp_cols <- c(comp_cols, comp_cols)
+#                 }
+#                 list(
+#                   qb_cols,
+#                   comp_cols
+#                 )
+#               })
+#             
+#             #Extract the qb/comparison vars
+#             qb_cols <- do.call("c", lapply(1:length(iter_vars), function(x) {
+#               iter_vars[[x]][[1]]
+#             }))
+#             comp_cols <- do.call("c", lapply(1:length(iter_vars), function(x) {
+#               iter_vars[[x]][[2]]
+#             }))
+#             
+#             #Add in the opponent and nfl comparison
+#             x_vars <- c(qb_cols, paste0("opp_", qb_vars))
+#             y_vars <- c(comp_cols, paste0("nfl_", qb_vars))
+#             
+#             #Create the differences
+#             pct_dif_table <-
+#               do.call("cbind.data.frame", lapply(1:length(x_vars), function(x) {
+#                 #Compute the percentage difference
+#                 pctdif <- (merged_tables[,x_vars[x]] - merged_tables[,y_vars[x]])/merged_tables[,y_vars[x]]
+#                 #If it is NaN/Inf/NA replace with the mean
+#                 #Find infinites
+#                 infinites <- which(is.infinite(pctdif) | is.nan(pctdif))
+#                 #Cap small values
+#                 pctdif[which((pctdif < -1) & (pctdif > -100))] <- -1
+#                 pctdif[which((pctdif > 2) & (pctdif < 1000))] <- 2
+#                 #Extract mean
+#                 avg <- if(length(infinites) > 0) { mean(pctdif[-infinites], na.rm = TRUE) } else { mean(pctdif, na.rm = TRUE) }
+#                 #Inject avg back
+#                 pctdif[which(is.infinite(pctdif) | is.nan(pctdif) | is.na(pctdif))] <- avg
+#                 #Transform into data frame
+#                 pctdif <- data.frame(pctdif)
+#                 colnames(pctdif) <- paste('pctDif', x_vars[x], y_vars[x], sep = '_')
+#                 pctdif
+#               }))
+#             
+#             #Now perform a pass attempt weighted average of the relative performance of QB to OPP/NFL
+#             vars <- paste('pctDif', qb_cols, comp_cols, sep = '_')
+#             pa <- merged_tables$PASS_ATT
+#             cumsumpa <- cumsum(pa)
+#             
+#             trail_pct_dif_avg <- 
+#               do.call("cbind.data.frame", lapply(1:length(vars), function(x) {
+#                 mtch_var <- match(vars[x], colnames(pct_dif_table))
+#                 do.call("c", lapply(1:nrow(pct_dif_table), function(k) {
+#                   w1 <- pa[1:k]/cumsumpa[k]
+#                   w2 <- pct_dif_table[1:k, mtch_var]
+#                   sum(w1*w2)
+#                 }))
+#               }))
+#             colnames(trail_pct_dif_avg) <- vars
+#             
+#             #Add back in the opponent vs nfl (needed no trailing cumulative average)
+#             cbind.data.frame(
+#               merged_tables %>%
+#                 mutate(game_num = row_number()) %>%
+#                 dplyr::select(Team, Season, Week, player, game_num),
+#               trail_pct_dif_avg,
+#               pct_dif_table[,!(colnames(pct_dif_table) %in% colnames(trail_pct_dif_avg))]
+#             ) %>%
+#               mutate(row = row_number())
+#           })) %>%
+#   #Grab total pass attempts by eligible starters and merge with first_timers
+#   left_join(
+#     eligible_passers %>%
+#       group_by(player) %>%
+#       summarise(pass_attempts = sum(PASS_ATT)),
+#     by = 'player') %>%
+#   filter(pass_attempts > 30) %>%
+#   group_by(row) %>%
+#   summarise_at(miss_impute, mean, na.rm = TRUE) %>%
+#   filter(row == 1)
+
+#################################
+# ~ Replace NA's with the first timers info #
+#################################
+
+for(i in 1:length(miss_impute)) {
+  qb_starters[is.na(qb_starters[,miss_impute[i]]), miss_impute[i]] <- as.numeric(first_timers[,miss_impute[i]][1])
+}
+
+#################################
+# ~ Merge qb information with the dataframe ~ #
+#################################
+
+#Set the keys for the comb df
+ha_ids <- c("Home_Team", "Away_Team")
+#Set the drop columns
+drop_vars <- c("Season", "Week", "Team", "game_id", "player")
+
+for(i in 1:length(ha_ids)) {
+  comb_df <- cbind.data.frame(comb_df, 
+                              qb_starters[match(paste(comb_df$Season, comb_df$Week, comb_df[, ha_ids[i]], sep = '_'), qb_starters$game_id),] %>%
+                                dplyr::select(-one_of(drop_vars)) %>%
+                                setNames(paste(ha_ids[i], names(.), sep = '_'))
+  )
+}
+
+#################################
+# ~ Import into Mongo DB and save ~ #
+#################################
+
+#Objects to import
+import_objs <- c('opp_dif_cur', 'cur_passer_stats', 'current_week_df', 'comb_df')
+
+#Tables to import them into
+import_table_names <- c('CUR_OPP_DIF', 'CUR_PASSER_STATS', 'CUR_TRAIL_STATS', 'PRE_PROCESS')
+
+for(i in 1:length(import_objs)) {
+  #Establish connection with the table
+  con <-
+    mongo(
+      collection = "NFL",
+      db = import_table_names[i],
+      url = paste0("mongodb+srv://", username, ":", password, '@nfl-bsxce.mongodb.net/')
+    )
+  #Drop anything that exists within it currently
+  con$drop()
+  #Insert the corresponding object
+  con$insert(get(import_objs[i]))
+  #Remove the connection
+  rm(con)
+}
+
+#Remove all objects
+rm(list=ls())
