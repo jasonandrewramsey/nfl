@@ -1,0 +1,657 @@
+#################################
+# Source scripts with functions/objects required
+#################################
+
+source('H:/NFL_v2/Scripts/Statistical_Functions.R')
+
+#################################
+# Import/assign data from mongo
+#################################
+
+username <- 'thatsmrlongcut'
+password <- 'football17'
+
+#Establish the tables to be imported from mongodb
+import_df <- data.frame(mongo_name = c('POSITION_MAPPING', 'PFF_TOTAL_GRADES', 'PFF_FIRST_TIME_GRADES', 'PFF_CURRENT_ROSTER', 'CUR_OPP_DIF', 'CUR_PASSER_STATS', 
+                                       'CUR_TRAIL_STATS', 'PFF_TEAM_NAMES', 'PFR_FIRST_TIME_QBS', 'PFF_GREENLINE', 'PFR_TEAM_NAMES2', 'PRE_PROCESS'),
+                        object_name = c('position_mapping', 'total_grades', 'first_time_starters', 'cur_roster', 'opp_dif_cur', 'cur_passer_stats', 
+                                        'current_week_df', 'pff_teamnames', 'first_timers', 'lines', 'pfr_dirtyteamnames', 'pre_process'),
+                        stringsAsFactors = FALSE)
+
+#Run a loop and import/assign
+for(i in 1:nrow(import_df)) {
+  #Establish connection with mongo db
+  con <-
+    mongo(
+      collection = "NFL",
+      db = import_df$mongo_name[i],
+      url = paste0("mongodb+srv://", username, ":", password, '@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+    )
+  #Assign object
+  assign(import_df$object_name[i], con$find(), envir = .GlobalEnv)
+  rm(con)
+}
+
+#################################
+# Weighted Starter / Total Snaps #
+#################################
+
+#Minor cleanup
+cur_roster <- 
+  cur_roster %>%
+  filter(roster_status %in% c('A', 'P'),
+         Datetime == max(Datetime)) %>%
+  mutate(Team = pff_teamnames$Team_ID[match(franchise_id, pff_teamnames$Franchise_ID)])
+
+#Starters and final clean up
+cur_roster <- 
+  cur_roster %>%
+  mutate(status = ifelse(id %in% (
+    cur_roster %>%
+      group_by(franchise_id, position) %>%
+      top_n(1, -depth) %>%
+      .$id
+  ), 'S', NA),
+  position = position_mapping$New_Position[match(position, position_mapping$Old_Position)],
+  total_snaps = ifelse(id %in% total_grades$player_id, total_grades$total_snaps[match(id, total_grades$player_id)],
+                       1),
+  weighted_grade = ifelse(id %in% total_grades$player_id, total_grades$weighted_grade[match(id, total_grades$player_id)],
+                          first_time_starters$avg_first[match(position, first_time_starters$position)])) %>%
+  filter(!is.na(weighted_grade))
+
+#Find the positions that have 0 snaps listed
+zero_snaps <-
+  cur_roster %>%
+  filter(position != 'FB') %>%
+  dcast(Team ~ position, fun.aggregate = sum, value.var = "total_snaps") %>%
+  melt(id.vars = 'Team', variable.name = 'position', value.name = 'total_snaps') %>%
+  filter(total_snaps == 0) %>%
+  mutate(team_pos = paste(Team, position, sep = '_'))
+
+#Identify the players to be backfilled
+backfill_pos <-
+  cur_roster %>%
+  filter(Team %in% zero_snaps$Team) %>%
+  mutate(primary_position = total_grades$position_primary[match(id, total_grades$player_id)],
+         primary_position_sc_pct = total_grades$percentage_total_snaps[match(id, total_grades$player_id)]) %>%
+  filter(paste(Team, primary_position, sep = '_') %in% zero_snaps$team_pos) %>%
+  group_by(Team, primary_position) %>%
+  top_n(1, -depth) %>%
+  as.data.frame
+
+#Backfill
+cur_roster$position[match(backfill_pos$id, cur_roster$id)] <- backfill_pos$primary_position
+
+#################################
+#~ Snapcount Weighted Average Grades ~ #
+#################################
+
+#Grab the full roster (agnostic of starter/sitter) weighted average grades
+full_grades <-
+  cur_roster %>%
+  filter(position != 'FB') %>%
+  group_by(Team, position) %>%
+  mutate(snap_weight = total_snaps/sum(total_snaps)) %>%
+  summarise(sc_weighted_grade = sum(snap_weight * weighted_grade)) %>%
+  spread(position, sc_weighted_grade) %>%
+  as.data.frame %>%
+  melt(id.vars = 'Team', 
+       value.name = "sc_weighted_grade", variable.name = "position") %>%
+  mutate(id = paste(Team, position, sep = '_'))
+
+#Weighted average starter grades
+weighted_avg_starter_grades <-
+  cur_roster %>%
+  filter(position != 'FB',
+         status == 'S') %>%
+  group_by(Team, position) %>%
+  mutate(snap_weight = total_snaps/sum(total_snaps)) %>%
+  summarise(sc_weighted_grade = sum(snap_weight * weighted_grade)) %>%
+  spread(position, sc_weighted_grade) %>%
+  melt(id.vars = c("Team"),
+       value.name = "sc_weighted_grade", variable.name = "position") %>%
+  mutate(id = paste(Team, position, sep = '_'),
+         sc_weighted_grade = ifelse(is.na(sc_weighted_grade),
+                                    full_grades$sc_weighted_grade[match(id, full_grades$id)],
+                                    as.numeric(sc_weighted_grade))) %>%
+  dplyr::select(-one_of('id')) %>%
+  spread(position, sc_weighted_grade, sep = '_') %>%
+  setNames(gsub("position", "grades", names(.))) %>%
+  as.data.frame %>%
+  pProc(., drop_columns = 'Team')
+
+#################################
+#~ Total Snapcount for Each Position ~#
+#################################
+
+#Grab total career snaps for each position agnostic of starter/sitter
+full_snaps <-
+  cur_roster %>%
+  filter(position != 'FB') %>%
+  group_by(Team, position) %>%
+  summarise(tot_snaps = sum(total_snaps, na.rm = TRUE)) %>%
+  spread(position, tot_snaps) %>%
+  melt(id.vars = c("Team"),
+       value.name = "tot_snaps", variable.name = "position") %>%
+  mutate(id = paste(Team, position, sep = '_'))
+
+#Starter total snapcounts
+starter_total_snaps <-
+  cur_roster %>%
+  filter(position != 'FB',
+         status == "S") %>%
+  group_by(Team, position) %>%
+  summarise(tot_snaps = sum(total_snaps, na.rm = TRUE)) %>%
+  spread(position, tot_snaps) %>%
+  melt(id.vars = c("Team"),
+       value.name = "tot_snaps", variable.name = "position") %>%
+  mutate(id = paste(Team, position, sep = '_'),
+         tot_snaps = ifelse(is.na(tot_snaps),
+                            full_snaps$tot_snaps[match(id, full_snaps$id)],
+                            as.numeric(tot_snaps))) %>%
+  dplyr::select(-one_of('id')) %>%
+  spread(position, tot_snaps, sep = '_') %>%
+  setNames(gsub("position", "snaps", names(.))) %>%
+  pProc(., drop_columns = 'Team')
+
+
+#################################
+#~ Total Starter Weighted Grade/Snapcount ~
+#################################
+
+#Total weighted starter roster grade and snapcount
+starters_compiled <-
+  cur_roster %>%
+  filter(!is.na(weighted_grade),
+         status == "S") %>%
+  group_by(Team) %>%
+  mutate(snap_weight = total_snaps/sum(total_snaps)) %>%
+  summarise(team_sc_weighted_grade = sum(snap_weight * weighted_grade),
+            team_total_snaps = sum(total_snaps, na.rm = TRUE)) %>%
+  as.data.frame %>%
+  pProc(., drop_columns = 'Team')
+
+#################################
+#~ Combine PFF Variables ~#
+#################################
+
+#Merge all the information together to get the player grade data frame
+player_grades <-
+  weighted_avg_starter_grades %>%
+  left_join(starter_total_snaps,
+            by = c("Team")) %>%
+  left_join(starters_compiled,
+            by = c("Team"))
+
+#################################
+#~ Get the Cumulative Passer Stats for each Starting QB~#
+#################################
+
+qb_starters <-
+cur_roster %>%
+  filter(position == 'QB',
+         status == 'S') %>%
+  mutate(player = paste(first_name, last_name, sep = ' ')) %>%
+  rowwise() %>%
+  mutate(player = clean_player_names(player)) %>%
+  dplyr::select(-one_of(c('id', 'first_name', 'last_name', 'franchise_id', 'position', 
+                          'roster_status', 'depth', 'status', 'Datetime', 'total_snaps',
+                          'weighted_grade'))) %>%
+  left_join(cur_passer_stats,
+            by = 'player') %>%
+    as.data.frame %>%
+  mutate(game_num = ifelse(is.na(game_num), 1, game_num))
+
+#################################
+# ~ Replace NA's with the first timers info #
+#################################
+
+#Vars to identify the first time starter averages for
+miss_impute <- c(
+  "pctDif_CPA_nfl_CPA", "pctDif_YPA_nfl_YPA", "pctDif_TDPA_nfl_TDPA", "pctDif_IPA_nfl_IPA", "pctDif_PASS_RATE_nfl_PASS_RATE",
+  "pctDif_CPA_CumSum_nfl_CPA", "pctDif_YPA_CumSum_nfl_YPA", "pctDif_TDPA_CumSum_nfl_TDPA", "pctDif_IPA_CumSum_nfl_IPA", 
+  "pctDif_PASS_RATE_CumSum_nfl_PASS_RATE", "pctDif_CPA_opp_CPA", "pctDif_YPA_opp_YPA", "pctDif_TDPA_opp_TDPA", 
+  "pctDif_IPA_opp_IPA", "pctDif_PASS_RATE_opp_PASS_RATE"
+)
+
+for(i in 1:length(miss_impute)) {
+  qb_starters[is.na(qb_starters[,miss_impute[i]]), miss_impute[i]] <- as.numeric(first_timers[,miss_impute[i]][1])
+}
+
+#################################
+# ~ Structure the lines to start the merging ~ #
+#################################
+
+lines <-
+lines %>%
+  filter(Timestamp == max(Timestamp)) %>%
+  mutate(Market_Game_Points = ifelse(is.na(Market_Game_Points), 47.5, as.numeric(Market_Game_Points))) %>%
+  mutate(SPREAD = ifelse(MARKET_FAVORED == 'AWAY', -1*as.numeric(MARKET_LINE), as.numeric(MARKET_LINE)),
+         OVER_UNDER = as.numeric(Market_Game_Points),
+         FAVORITE = ifelse(SPREAD < 0, 1, ifelse(SPREAD == 0, 0.5, 0)),
+         Expected_Points = ifelse(FAVORITE == 1, OVER_UNDER - ((OVER_UNDER  + SPREAD)/2), ifelse(FAVORITE == 0, (OVER_UNDER - SPREAD)/2, OVER_UNDER/2)),
+         Expected_Points_Alwd = OVER_UNDER - Expected_Points,
+         Spread_Pct_Over_Under = abs(SPREAD)/OVER_UNDER) %>%
+  dplyr::select(Home_Team, Away_Team, Season, Week, SPREAD, OVER_UNDER, FAVORITE, Expected_Points, Expected_Points_Alwd, Spread_Pct_Over_Under, Game_Date_Time)
+
+
+#################################
+# ~ Merge in the current week trailing stats to the lines ~#
+#################################
+
+ha_names <- c('Home_Team', 'Away_Team')
+
+comb_df <- 
+  cbind.data.frame(lines, 
+                   do.call("cbind.data.frame", lapply(1:length(ha_names), function(i) {
+                     current_week_df[match(lines[,ha_names[i]], current_week_df$Team),] %>%
+                       dplyr::select(-one_of('Season', 'Week', 'Team')) %>%
+                       setNames(paste(ha_names[i], names(.), sep = '_'))
+                   })))
+
+#################################
+# ~ Merge in the Player Grades with the Combined Data Frame ~ #
+#################################
+
+comb_df <-
+  cbind.data.frame(comb_df,
+                   do.call("cbind.data.frame", lapply(1:length(ha_names), function(i) {
+                     player_grades[match(comb_df[,ha_names[i]], player_grades$Team),] %>%
+                       dplyr::select(-one_of('Team')) %>%
+                       setNames(paste(ha_names[i], names(.), sep = '_'))
+                   })))
+
+#################################
+# ~ Merge the QB Passer stats with their Opponent
+#################################
+
+qb_starters <-
+qb_starters %>%
+  mutate(Opponent = comb_df$Away_Team[match(Team, comb_df$Home_Team)],
+         Opponent = ifelse(is.na(Opponent), comb_df$Home_Team[match(Team, comb_df$Away_Team)], Opponent)) %>%
+  left_join(opp_dif_cur %>%
+              dplyr::select(-one_of(c('Season', 'Week', 'Team'))),
+            by = 'Opponent')
+
+#################################
+# ~ Merge the QB Starters with the Combined Data Frame ~ #
+#################################
+
+comb_df <-
+  cbind.data.frame(comb_df,
+                   do.call("cbind.data.frame", lapply(1:length(ha_names), function(i) {
+                     qb_starters[match(comb_df[, ha_names[i]], qb_starters$Team),] %>%
+                       dplyr::select(-one_of(c('Team', 'player', 'Opponent'))) %>%
+                       setNames(paste(ha_names[i], names(.), sep = '_'))
+                   })))
+
+#################################
+# ~ Add the identity variables ~ #
+#################################
+
+comb_df <- 
+  comb_df %>%
+  mutate(Season = current_week_df$Season[1],
+         Week = current_week_df$Week[1],
+         Over_Under_Coverage = 'push',
+         Point_Differential = 0,
+         Win_Loss = 'tie',
+         Spread_Coverage = 'push',
+         Game_Total_Points = 0,
+         Total_Points = 0,
+         Total_Points_Alwd = 0)
+
+comb_df[which(is.na(comb_df[,'Away_Team_grades_RG'])), 'Away_Team_grades_RG'] <- 0
+comb_df[which(is.na(comb_df[,'Away_Team_snaps_RG'])), 'Away_Team_snaps_RG'] <- 0
+
+#################################
+# Extract the Layer 1 Predictions #
+#################################
+
+#Target variables
+y_vars <- c('Over_Under_Coverage', 'Point_Differential', 'Win_Loss',
+            'Spread_Coverage', 'Game_Total_Points', 'Total_Points',
+            'Total_Points_Alwd')
+
+#Positive Classes (for classification)
+pos_classes <- c('over', NA, 'win', 'covered', NA, NA, NA)
+
+#Set the path to the layer 1 models
+l1_path <- 'H:/NFL_v2/Stacked Models/Layer 1/'
+
+#Create the function to remove model names
+remove_model_names <- function(text) {
+  mnames <- c('_rf.rds', '_lm.rds', '_xgb.rds', '_gbm.rds')
+  for(i in 1:length(mnames)) {
+    if(grepl(mnames[i], text, fixed = TRUE, ignore.case = FALSE)) {
+      text <- gsub(mnames[i], '', text)
+      break
+    }
+  }
+  return(text)
+}
+
+#Grab the layer 1 data frame of predictions
+layer1_prediction_df <-
+  do.call("cbind.data.frame", 
+          lapply(1:length(list.files(l1_path)), function(k) {
+            #Original Model name
+            model_name <- list.files(l1_path)[k]
+            
+            #Read and predict
+            model <- readRDS(paste0(l1_path, model_name))$Model
+            
+            #Grab the features
+            features <- model$features
+            
+            #Grab the type
+            type <- model$task.desc$type
+            
+            #Make a copy of the data
+            df_copy <- comb_df %>%
+              #Grab only the required features
+              dplyr::select(one_of(c(remove_model_names(model_name), model$features)))
+            
+            #Rename the first column
+            colnames(df_copy)[1] <- 'target'
+            
+            #If it is a classification task, identify the positive variable
+            p_var <- pos_classes[match(remove_model_names(model_name), y_vars)]
+            
+            #Transform into a task
+            df_task <- if(type == 'classif') {
+              makeClassifTask(data = df_copy,
+                              target = 'target')
+            } else {
+              makeRegrTask(data = df_copy,
+                           target = 'target')
+            }
+            
+            #Make predictions from the model
+            preds <-
+              if(type == 'regr') {
+                predict(model, df_task)$data$response } else {
+                  predict(model, df_task)$data[, paste0('prob.', p_var)]
+                }
+            
+            #Make into a data frame
+            preds <- data.frame(preds)
+            
+            #Rename column
+            colnames(preds) <- gsub('.rds', '', model_name)
+            
+            #Return the data
+            preds
+          }))
+
+#################################
+# Extract the Layer 2 Predictions #
+#################################
+
+#Target variables
+y_vars <- c('Over_Under_Coverage', 'Point_Differential', 'Win_Loss',
+            'Spread_Coverage', 'Game_Total_Points', 'Total_Points',
+            'Total_Points_Alwd')
+
+#Positive Classes (for classification)
+pos_classes <- c('over', NA, 'win', 'covered', NA, NA, NA)
+
+#Set the path to the layer 1 models
+l2_path <- 'H:/NFL_v2/Stacked Models/Layer 2/'
+
+#Grab the layer 2 data frame of predictions
+layer2_prediction_df <-
+  do.call("cbind.data.frame", 
+          lapply(1:length(list.files(l2_path)), function(k) {
+            #Original Model name
+            model_name <- list.files(l2_path)[k]
+            
+            #Read and predict
+            model <- readRDS(paste0(l2_path, model_name))$Model
+            
+            #Grab the features
+            features <- model$features
+            
+            #Grab the type
+            type <- model$task.desc$type
+            
+            #Make a copy of the data
+            df_copy <- 
+              cbind.data.frame(comb_df,
+                               layer1_prediction_df) %>%
+              #Grab only the required features
+              dplyr::select(one_of(c(gsub('_L2.rds', '', model_name), model$features)))
+            
+            #Rename the first column
+            colnames(df_copy)[1] <- 'target'
+            
+            #If it is a classification task, identify the positive variable
+            p_var <- pos_classes[match(gsub('_L2.rds', '', model_name), y_vars)]
+            
+            #Transform into a task
+            df_task <- if(type == 'classif') {
+              makeClassifTask(data = df_copy,
+                              target = 'target')
+            } else {
+              makeRegrTask(data = df_copy,
+                           target = 'target')
+            }
+            
+            #Make predictions from the model
+            preds <-
+              if(type == 'regr') {
+                predict(model, df_task)$data$response } else {
+                  predict(model, df_task)$data[, paste0('prob.', p_var)]
+                }
+            
+            #Make into a data frame
+            preds <- data.frame(preds)
+            
+            #Rename column
+            colnames(preds) <- gsub('.rds', '', model_name)
+            
+            #Return the data
+            preds
+            
+          }))
+
+#Combine
+comb_df <- cbind.data.frame(comb_df, layer2_prediction_df)
+
+#################################
+# Read and store the classification model predictions #
+#################################
+
+#Target variables
+y_vars <- c('Over_Under_Coverage','Spread_Coverage')
+
+#Positive Classes (for classification)
+pos_classes <- c('over', 'covered')
+
+#Set path where models are stored
+path <- 'H:/NFL_v2/Stacked Models/Aggregate/'
+
+classification_layer_df <-
+  do.call("cbind.data.frame", 
+          lapply(1:length(y_vars), function(i) {
+            
+            #Establish the variable
+            var <- y_vars[i]
+            
+            #Read in the model
+            model_bin <- readRDS(paste(path, paste0(var, '.rds'), sep = '/'))
+            
+            #Read and predict for each model
+            tgbtg <-
+              do.call("cbind.data.frame", 
+                      lapply(1:length(model_bin), function(j) {
+                        #Store the model
+                        model <- model_bin[[j]]$Model
+                        
+                        #Grab the features
+                        features <- model$features
+                        
+                        #Grab the type
+                        type <- model$task.desc$type
+                        
+                        #Make a copy of the data
+                        df_copy <- 
+                          comb_df %>%
+                          #Grab only the required features
+                          dplyr::select(one_of(c(var, features)))
+                        
+                        #Rename the first column
+                        colnames(df_copy)[1] <- 'target'
+                        
+                        #Transform into a task
+                        df_task <- if(type == 'classif') {
+                          makeClassifTask(data = df_copy,
+                                          target = 'target')
+                        } else {
+                          makeRegrTask(data = df_copy,
+                                       target = 'target')
+                        }
+                        
+                        #Make predictions from the model
+                        preds <-
+                          if(type == 'regr') {
+                            predict(model, df_task)$data$response } else {
+                              predict(model, df_task)$data[, paste0('prob.', pos_classes[i])]
+                            }
+                        
+                        #Make into a data frame
+                        preds <- data.frame(preds)
+                        colnames(preds) <- paste0('M', j)
+                        preds
+                      }))
+            
+            #Average each column
+            preds <- data.frame(do.call("c", lapply(1:nrow(tgbtg), function(j) {
+              mean(as.numeric(tgbtg[j,]))
+            })))
+            
+            #Rename column
+            colnames(preds) <- paste0(var, '_Classification_Prediction')
+            
+            #Output
+            preds
+          }))
+
+#Add the parents to the data frame
+comb_df <- 
+  cbind.data.frame(comb_df, classification_layer_df) %>%
+  mutate(OUC_Classification_Binary_Response = ifelse(Over_Under_Coverage_Classification_Prediction > 0.5, 'over', 'under'),
+         SC_Classification_Binary_Response = ifelse(Spread_Coverage_Classification_Prediction > 0.5, 'covered', 'loss'))
+
+#################################
+# Read the continuous models for analysis #
+#################################
+
+#Target variables
+y_vars <- c('Game_Total_Points','Point_Differential')
+
+#Folder names
+x_vars <- c('Over_Under_Coverage','Spread_Coverage')
+
+#Set path where models are stored
+path <- 'H:/NFL_v2/Stacked Models/Aggregate/'
+
+#Positive Classes (for classification)
+pos_classes <- c('over', 'covered')
+
+continuous_layer_df <-
+  do.call("cbind.data.frame", 
+          lapply(1:length(y_vars), function(i) {
+            
+            #Establish the variable
+            var <- y_vars[i]
+            
+            #Read in the model
+            model_bin <- readRDS(paste(path, paste0(var, '.rds'), sep = '/'))
+            
+            #Read and predict for each model
+            tgbtg <-
+              do.call("cbind.data.frame", 
+                      lapply(1:length(model_bin), function(j) {
+                        #Store the model
+                        model <- model_bin[[j]]$Model
+                        
+                        #Grab the features
+                        features <- model$features
+                        
+                        #Grab the type
+                        type <- model$task.desc$type
+                        
+                        #Make a copy of the data
+                        df_copy <- 
+                          comb_df %>%
+                          #Grab only the required features
+                          dplyr::select(one_of(c(var, features)))
+                        
+                        #Rename the first column
+                        colnames(df_copy)[1] <- 'target'
+                        
+                        #Transform into a task
+                        df_task <- if(type == 'classif') {
+                          makeClassifTask(data = df_copy,
+                                          target = 'target')
+                        } else {
+                          makeRegrTask(data = df_copy,
+                                       target = 'target')
+                        }
+                        
+                        #Make predictions from the model
+                        preds <-
+                          if(type == 'regr') {
+                            predict(model, df_task)$data$response } else {
+                              predict(model, df_task)$data[, paste0('prob.', pos_classes[i])]
+                            }
+                        
+                        #Make into a data frame
+                        preds <- data.frame(preds)
+                        colnames(preds) <- paste0('M', j)
+                        preds
+                      }))
+            
+            #Average each column
+            preds <- data.frame(do.call("c", lapply(1:nrow(tgbtg), function(j) {
+              mean(as.numeric(tgbtg[j,]))
+            })))
+            
+            #Rename column
+            colnames(preds) <- paste0(x_vars[i], '_Continuous_Prediction')
+            
+            #Output
+            preds
+          }))
+
+comb_df <-
+  cbind.data.frame(comb_df, continuous_layer_df) %>%
+  mutate(OUC_Continuous_Binary_Response = ifelse((Over_Under_Coverage_Continuous_Prediction - OVER_UNDER) > 0, 'over', 'under'),
+         SC_Continuous_Binary_Response = ifelse((Spread_Coverage_Continuous_Prediction + SPREAD) > 0, 'covered', 'loss'))
+
+#################################
+# Structure and output baby #
+#################################
+
+final_df <-
+comb_df %>%
+  mutate(Last_Updated_Roster = cur_roster$Datetime[1]) %>%
+  dplyr::select(Home_Team, Away_Team, Expected_Points, Expected_Points_Alwd, SPREAD,
+                Spread_Coverage_Classification_Prediction, Spread_Coverage_Continuous_Prediction, SC_Classification_Binary_Response, SC_Continuous_Binary_Response,
+                OVER_UNDER, Over_Under_Coverage_Classification_Prediction, Over_Under_Coverage_Continuous_Prediction, 
+                OUC_Classification_Binary_Response, OUC_Continuous_Binary_Response, Last_Updated_Roster, Game_Date_Time)
+
+#Store in MongoDB
+#Establish connection with mongo db
+con <-
+  mongo(
+    collection = "NFL",
+    db = 'CURRENT_PREDICTIONS',
+    url = paste0("mongodb+srv://", username, ":", password, '@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+  )
+#Assign object
+con$drop()
+con$insert(final_df)
+
+rm(list=ls())
