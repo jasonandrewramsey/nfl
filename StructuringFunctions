@@ -1,0 +1,1709 @@
+#First call the package import/load script
+source('H:/NFL_v2/Scripts/Package_Import.R')
+source('H:/NFL_v2/Scripts/Statistical_Functions.R')
+
+#Establish table names in the mongo db
+tables <- c("pfr_teamnames", "pfr_dirtyteamnames", "fo_teamnames", "pff_teamnames")
+
+#Run query in MongoDB to extract the required tables
+for(x in 1:length(tables)) {
+  #Establish connection with mongo db
+  con <-
+    mongo(
+      collection = "Collection0",
+      db = tables[x],
+      url = "mongodb+srv://thatsmrlongcut:football17@cluster0-ttntc.mongodb.net/test?retryWrites=true&w=majority"
+    )
+  #Extract table
+  assign(tables[x], con$find(), envir = .GlobalEnv)
+  #Remove the connection
+  rm(con)
+}
+
+#Function to start an automated browser port
+start_selenium <- function() {
+  assign("rD", { tryCatch({ rsDriver(port = as.integer(4000+sample(1:3000,1)), 
+                                     browser = "chrome",
+                                     version = "3.141.5",
+                                     chromever = "78.0.3904.105") },
+                          error = function(e) { rsDriver(port = as.integer(4000+sample(1:3000,1)), 
+                                                         browser = "chrome",
+                                                         version = "3.141.5",
+                                                         chromever = "76.0.3809.12") }) },
+         envir = .GlobalEnv)
+  
+  assign("remDr", rD$client, envir = .GlobalEnv)
+}
+
+
+#Function to extract xpaths from the URL
+extract_xpaths <- function(url) {
+  read_html(url) %>%
+    html_nodes("*") %>%
+    html_attr("id") %>%
+    unique() %>%
+    as.data.frame %>%
+    filter(grepl('all_', ., fixed = TRUE) == TRUE) %>%
+    mutate(table = gsub('all_', "", .)) %>%
+    .$table
+}
+
+#Function to extract data from the xpaths on a URL
+#Shadow dependency is that you have an automated browser port running
+#I don't know how to make this dependency callable/identifiable
+extract_xpath_data <- function(url) {
+  #Navigate to the web page
+  remDr$navigate(url)
+  page <- remDr$getPageSource()
+  
+  #Grab the xpaths from the url
+  xpths <- extract_xpaths(url)
+  
+  #Use automated port to grab the data for each xpath
+  xpth_data <- 
+    lapply(1:length(xpths), function(w) {
+      tryCatch({ #Add in a tryCatch to try to avoid hanging/failing scrape attempts
+        data <-
+          page[[1]] %>%
+          read_html() %>%
+          html_nodes(xpath=paste0('//*[@id="', xpths[w], '"]')) %>%
+          html_table(fill = T)
+        data[[1]]
+      }, error = function(e) { #If error print the fact there was an error
+        #print(paste0('Failed attempt for ', xpths[w], ' using URL ', url))
+        #I did not add this because I fear it may store the character printed in the list
+      } )
+    })
+  
+  #Give proper names
+  names(xpth_data) <- xpths
+  
+  #Use plyr:: to compact and remove NULL's
+  xpth_data <- plyr::compact(xpth_data)
+  
+  #Return the data scraped
+  return(xpth_data)
+}
+
+#Function to extract all game data into one object
+compile_game_info <- function(url) {
+  #First extract the game data
+  game_data <-
+    as.character(url) %>%
+    read_html() %>%
+    html_table()
+  #Rename the list objects
+  names(game_data) <- c('quarterly_scores', 'scoring_summary')
+  
+  #Extract xpath data
+  xpth_data <- extract_xpath_data(url)
+  
+  #Extract text data (not used currently)
+  text_data <- 
+    as.character(url) %>%
+    read_html() %>%
+    html_text()
+  
+  #Add the two together
+  game_info <- c(game_data, xpth_data, text = text_data)
+  
+  #Make it one dimensional
+  #dim(game_info) <- c(1,1)
+  
+  #Return it
+  return(game_info)
+}
+
+#Function to extract the allowed points
+alwd <- function(...) {
+  sum(...) - (...)
+}
+
+#Function to clean and structure the quarterly scores
+structure_quarterly_scores <- function(data) {
+  #Data frame for column name conversion
+  name_conversion <-
+    data.frame(old_names = c("", "1", "2", "3", "4", "OT", "OT2", "Final"),
+               new_names = c("Team", "Q1_Points", "Q2_Points", "Q3_Points", "Q4_Points", "OT", "OT2", 'Total_Points'))
+  
+  #Define the columns that will be mutated
+  mut_cols <- c("Total_Points", "OT_Points", as.character(name_conversion$new_names[grepl("Q", name_conversion$new_names)]))
+
+  #Call in the original data
+  tb1 <- data$quarterly_scores[,-1]
+  colnames(tb1) <- name_conversion$new_names[match(colnames(tb1), name_conversion$old_names)]
+  
+  #Populate the matrix
+  qrtly_scores <-
+    rbind.fill(
+      as.data.frame(
+        matrix(NA, nrow = 0, ncol = nrow(name_conversion), 
+               dimnames = list(NULL, name_conversion$new_names))
+      ),
+      tb1) %>%
+    mutate(OT_Points = OT + OT2) %>% #Transform OT to just 1 column
+    dplyr::select(-one_of(c('OT', 'OT2'))) %>%
+    #Add in the allowed stats by applying the alwd function
+    mutate_at(.vars = mut_cols,
+              list(Alwd = alwd)) %>%
+    mutate(Team = pfr_dirtyteamnames$Team_ID[match(Team, pfr_dirtyteamnames$Dirty_Name)])
+  
+  #Add Home/Away
+  qrtly_scores$Home_Away <- c('Away', 'Home')
+  
+  #Return the cleaned object
+  return(qrtly_scores)
+}
+
+#Create a function to structure the team summary stats
+structure_team_stats <- function(data, season) {
+  #Establish the names of the columns that are going to be included and their new names
+  name_conversion <-
+    data.frame(old_names = c("Team", "First Downs", "Rush-Yds-TDs", "Cmp-Att-Yd-TD-INT", "Sacked-Yards", 
+                             "Net Pass Yards", "Total Yards", "Fumbles-Lost", "Turnovers", "Penalties-Yards",
+                             "Third Down Conv.", "Fourth Down Conv.", "Time of Possession"),
+               
+               new_names = c("Team", "FDS", "RUSH", "PASS", "SCK", "NPYDS", "TYDS", "FUM", "TO", "PEN",
+                             "THRD", "FRTH", "TOP")
+    )
+  
+  #Create the list that determines the splitting behavior and names
+  split_conversions <-
+    list(
+      RUSH = c("RUSH_ATT", "RUSH_YDS", "RUSH_TDS"),
+      PASS = c("PASS_CMP", "PASS_ATT", "PASS_YDS", "PASS_TDS", "PASS_INT"),
+      SCK = c("SCK", "SCK_YDS"),
+      FUM = c("FUM", "FUM_LST"),
+      PEN = c("PEN", "PEN_YDS"),
+      THRD = c("THRD_CONV", "THRD_ATT"),
+      FRTH = c("FRTH_CONV", "FRTH_ATT")
+    )
+  
+  #Transform the initial SHIT into a working copy
+  tb1 <- data$team_stats
+  tb2 <- data.frame(t(tb1)[-1,], row.names = NULL, stringsAsFactors = FALSE)
+  colnames(tb2) <- as.character(tb1[,1])
+  tb2$Team <- colnames(tb1)[-1]
+  colnames(tb2) <- name_conversion$new_names[match(colnames(tb2), name_conversion$old_names)]
+  
+  #Reduce split_conversions to those in the data
+  split_conversions <- split_conversions[names(split_conversions) %in% colnames(tb2)]
+  
+  #Rbind fill into the pre-made dataframe
+  rbind.fill(
+    as.data.frame(
+      matrix(NA, nrow = 0, ncol = nrow(name_conversion), 
+             dimnames = list(NULL, as.character(name_conversion$new_names)))
+    ),
+    tb2) %>%
+    #Loop through and separate each "-" delimitted column
+    dplyr::select(-one_of(names(split_conversions))) %>%
+    left_join(
+      Reduce(merge, lapply(1:length(split_conversions), function(x) {
+        tb2 %>%
+          dplyr::select(Team, (!!sym(names(split_conversions)[x]))) %>%
+          separate(col = (!!sym(names(split_conversions)[x])), into = split_conversions[[x]], convert = TRUE)
+      })),
+      by = 'Team') %>%
+    #Do TOP differently
+    separate(col = TOP, into = c("TOP_MINUTES", "TOP_SECONDS"), convert = TRUE) %>%
+    mutate(TOP = TOP_MINUTES + (TOP_SECONDS/60)) %>%
+    dplyr::select(-one_of(c('TOP_MINUTES', 'TOP_SECONDS'))) %>%
+    #Transform Team to factor so that it wont be converted
+    mutate(Team = as.factor(Team)) %>%
+    #Transform all characters to numerics
+    mutate_if(is.character, as.numeric) %>%
+    #Add the allowed stats now
+    mutate_at(vars(-Team), 
+              list(Alwd = alwd)) %>%
+    #Transform team back
+    mutate(Team = pfr_teamnames$Team_ID[match(paste(Team, season, sep = '_'),
+                                              paste(pfr_teamnames$Team_ABB, pfr_teamnames$Season, sep = '_'))])
+}
+
+
+over_under <- function(Over.Under) {
+  if(is.na(Over.Under)) {
+    0
+  } else {
+    as.numeric(
+      gsub(" ", "", 
+           gsub("push", "", 
+                gsub("under", "", 
+                     gsub("over", "",
+                          gsub("[()]", "", Over.Under))))))
+  }
+}
+
+get_spread <- function(vegas_line) {
+  if(vegas_line == "Pick") {
+    data.frame(
+      FAVORITE = NA,
+      SPREAD = 0
+    )
+  } else {
+    #Split by the "-" sign
+    res <- strsplit(vegas_line, " -")[[1]]
+    
+    #Return the team id for the favorite (must match the names to the team.names object)
+    fav <-  pfr_dirtyteamnames$Team_ID[match(res[1],  pfr_dirtyteamnames$Dirty_Name)]
+    #Turn the spread into a numeric field
+    spread <- as.numeric(paste(res[2]))
+    
+    #Combine the two
+    data.frame(
+      FAVORITE = fav,
+      SPREAD = spread)
+  }
+}
+
+structure_game_info <- function(data) {
+  #Establish the names of the columns that are going to be included and their new names
+  name_conversion <-
+    data.frame(old_names = c("Won_Toss", "Roof", "Surface", "Weather", "Vegas_Line", "Over_Under"),
+               
+               new_names = c("WON_TOSS", "ROOF", "SURFACE", "WEATHER", "VEGAS_LINE", "OVER_UNDER")
+    )
+  
+  tryCatch({
+    #Transform the initial SHIT into a working copy
+    tb1 <- data$game_info
+    tb1 <- data.frame(t(tb1[-1,]), row.names = NULL, stringsAsFactors = FALSE)
+    colnames(tb1) <- gsub(" ", "_", gsub("[[:punct:]]", "_", tb1[1,]))
+    tb1 <- tb1[-1,]
+    colnames(tb1) <- name_conversion$new_names[match(colnames(tb1), name_conversion$old_names)]
+    tb1 <- tb1[,!is.na(colnames(tb1))]
+    
+    #Rbind fill into the pre-made dataframe
+    tb2 <- 
+      rbind.fill(
+        as.data.frame(
+          matrix(NA, nrow = 0, ncol = nrow(name_conversion), 
+                 dimnames = list(NULL, as.character(name_conversion$new_names)))
+        ),
+        tb1) %>%
+      as.data.frame %>%
+      rowwise() %>%
+      mutate(OVER_UNDER = over_under(paste(OVER_UNDER)))
+    
+    cbind.data.frame(tb2, get_spread(tb2$VEGAS_LINE)) %>%
+      dplyr::select(-one_of('VEGAS_LINE'))
+  }, error = function(e) {} )
+}
+
+#Define the function that will structure the text of the game into a data frame
+structure_text <- function(data) {
+  #Define the weekdays for search purposes
+  week_days <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+  
+  #The text is always the first list element
+  text <- gsub("[\r\n\t]", " ", data$text) #Clean HTML from it
+  
+  #Find the game date
+  #Locate the indicator (weekday) -- don't know which weekday it is so check for all of them
+  find_wday <-
+    do.call("rbind", 
+            lapply(1:length(week_days), function(z) {
+              str_locate_all(text, week_days[z])[[1]]
+            })) %>%
+    as.data.frame %>%
+    arrange(start)
+  
+  #Split by uppercase and space in the first found weekday string
+  str_wday <- strsplit(gsub("([[:upper:]])", " \\1", 
+                            substr(text,
+                                   find_wday[1,1]-10,
+                                   find_wday[1,2]+20)), " ")[[1]]
+  
+  #Find which one begins the date (month.abb)
+  find_month <- which(str_wday %in% month.abb)
+  
+  #Structure the date accordingly -- don't store as date until time is added
+  game_date <- paste(str_wday[find_month], 
+                     str_wday[find_month + 1], 
+                     str_wday[find_month + 2], 
+                     sep = " ")
+  
+  #Find the game time
+  #Locate the indicator (Start Time:)
+  find_st_time <- str_locate_all(text, "Start Time:")[[1]]
+  
+  #Split by uppercase and space
+  str_st_time <- strsplit(gsub("([[:upper:]])", " \\1", 
+                               substr(text, 
+                                      find_st_time[1,1]-10, 
+                                      find_st_time[1,2]+20)), " ")[[1]]
+  
+  #Find which one begins the time (Time:)
+  find_date <- which(str_st_time == 'Time:')
+  
+  #Structure the date accordingly -- don't store as date until time is added
+  game_time <- str_st_time[find_date + 1]
+  
+  ###### Combine the date and time
+  #Structure game date time asPOSIX (date time format) & add to output dataframe
+  as.POSIXct(paste(game_date, game_time, sep = " "),format = '%b %d, %Y %I:%M%p')
+}
+
+structure_player_offense <- function(data) {
+  #Establish the names of the columns that are going to be included and their new names
+  name_conversion <-
+    data.frame(old_names = c("Player", "Tm", "PassingCmp", "PassingAtt", "PassingYds", "PassingTD", "PassingInt",
+                             "PassingSk", "PassingSkYds", "PassingLng", "PassingRate", "RushingAtt", "RushingYds", "RushingTD", 
+                             "RushingLng", "ReceivingTgt", "ReceivingRec", "ReceivingYds", "ReceivingTD",
+                             "ReceivingLng", "FumblesFmb", "FumblesFL"),
+               
+               new_names = c("Player", "Team", "PASS_CMP", "PASS_ATT", "PASS_YDS", "PASS_TDS", "PASS_INT", "PASS_SCK", "PASS_SCK_YDS", "PASS_LNG",
+                             "PASS_RATE", "RUSH_ATT", "RUSH_YDS", "RUSH_TDS", "RUSH_LNG", "REC_TGT", "REC_REC", "REC_YDS", "REC_TDS", "REC_LNG",
+                             "FUM_FUM", "FUM_LST")
+    )
+  
+  tryCatch({
+  #Structure the bullshit that pops out
+  tb1 <- data$player_offense
+  colnames(tb1) <- paste0(colnames(tb1), as.character(unname(tb1[1,])))
+  tb1 <- tb1[-1,]
+  #Rename the redundant pass yds due to sacks
+  colnames(tb1)[which(colnames(tb1) == 'PassingYds')[2]] <- "PassingSkYds"
+  #Fix the names
+  colnames(tb1) <- name_conversion$new_names[match(colnames(tb1), name_conversion$old_names)]
+  #Rbind fill into the pre-made dataframe
+  rbind.fill(
+    as.data.frame(
+      matrix(NA, nrow = 0, ncol = nrow(name_conversion), 
+             dimnames = list(NULL, as.character(name_conversion$new_names)))
+    ),
+    tb1) %>%
+    #Get rid of the splits and transform the names of players
+    filter(Player %in% c("",  'Player') == FALSE) %>%
+    rowwise() %>%
+    mutate(player = clean_player_names(Player)) %>%
+    as.data.frame %>%
+    #Transform to numeric from character
+    mutate_at(vars(-player, -Team, -Player), as.numeric) %>%
+    mutate(OFF_Player = Player) %>%
+    dplyr::select(-one_of('Player'))
+  }, error = function(e) {} )
+}
+
+structure_player_defense <- function(data) {
+  #Establish the names of the columns that are going to be included and their new names
+  name_conversion <-
+    data.frame(old_names = c("Player", "Tm", "Def_InterceptionsInt", "Def_InterceptionsYds", "Def_InterceptionsTD" , "Def_InterceptionsLng",
+                             "Def_InterceptionsPD", "Sk", "TacklesComb", "TacklesSolo", "TacklesAst", "TacklesTFL", "TacklesQBHits", "FumblesFR",
+                             "FumblesYds", "FumblesTD", "FumblesFF"),
+               
+               new_names = c("Player", "Team", "DEF_INT", "DEF_INT_YDS", "DEF_INT_TDS", "DEF_INT_LNG", "DEF_INT_PD", "DEF_SCK", "DEF_TCK_COMB",
+                             "DEF_TCK_SOL", "DEF_TCK_AST", "DEF_TCK_TFL", "DEF_TCK_QBH", "DEF_FUM_REC", "DEF_FUM_YDS", "DEF_FUM_TDS", "DEF_FUM_FRC")
+    )
+  
+  tryCatch({
+  #Structure the bullshit that pops out
+  tb1 <- data$player_defense
+  colnames(tb1) <- gsub(" ", "_", paste0(colnames(tb1), as.character(unname(tb1[1,]))))
+  tb1 <- tb1[-1,]
+  #Fix the names
+  colnames(tb1) <- name_conversion$new_names[match(colnames(tb1), name_conversion$old_names)]
+  #Rbind fill into the pre-made dataframe
+  rbind.fill(
+    as.data.frame(
+      matrix(NA, nrow = 0, ncol = nrow(name_conversion), 
+             dimnames = list(NULL, as.character(name_conversion$new_names)))
+    ),
+    tb1) %>%
+    #Get rid of the splits and transform the names of players
+    filter(Player %in% c("",  'Player') == FALSE) %>%
+    rowwise() %>%
+    mutate(player = clean_player_names(Player)) %>%
+    as.data.frame %>%
+    #Transform to numeric from character
+    mutate_at(vars(-player, -Team, -Player), as.numeric) %>%
+    mutate(DEF_Player = Player) %>%
+    dplyr::select(-one_of('Player'))
+  }, error = function(e) {} )
+}
+
+structure_returns <- function(data) {
+  #Establish the names of the columns that are going to be included and their new names
+  name_conversion <-
+    data.frame(old_names = c("Player", "Tm", "Kick_ReturnsRt", "Kick_ReturnsYds", "Kick_ReturnsY_Rt", "Kick_ReturnsTD",
+                             "Kick_ReturnsLng", "Punt_ReturnsRet", "Punt_ReturnsYds", "Punt_ReturnsY_R", "Punt_ReturnsTD", "Punt_ReturnsLng"),
+               
+               new_names = c("Player", "Team", "KCK_RET", "KCK_RET_YDS", "KCK_RET_YPR", "KCK_RET_TDS", "KCK_RET_LNG",
+                             "PNT_RET", "PNT_RET_YDS", "PNT_RET_YPR", "PNT_RET_TDS", "PNT_RET_LNG")
+    )
+  
+  tryCatch({
+  #Structure the bullshit that pops out
+  tb1 <- data$returns
+  colnames(tb1) <- gsub(" ", "_", gsub("[[:punct:]]", "_", paste0(colnames(tb1), as.character(unname(tb1[1,])))))
+  tb1 <- tb1[-1,]
+  #Fix the names
+  colnames(tb1) <- name_conversion$new_names[match(colnames(tb1), name_conversion$old_names)]
+  #Rbind fill into the pre-made dataframe
+  rbind.fill(
+    as.data.frame(
+      matrix(NA, nrow = 0, ncol = nrow(name_conversion), 
+             dimnames = list(NULL, as.character(name_conversion$new_names)))
+    ),
+    tb1) %>%
+    #Get rid of the splits and transform the names of players
+    filter(Player %in% c("",  'Player') == FALSE) %>%
+    rowwise() %>%
+    mutate(player = clean_player_names(Player)) %>%
+    as.data.frame %>%
+    #Transform to numeric from character
+    mutate_at(vars(-player, -Team, -Player), as.numeric) %>%
+    mutate(RET_Player = Player) %>%
+    dplyr::select(-one_of('Player'))
+  }, error = function(e) {} )
+}
+
+structure_kicking <- function(data) {
+  #Establish the names of the columns that are going to be included and their new names
+  name_conversion <-
+    data.frame(old_names = c("Player", "Tm", "ScoringXPM", "ScoringXPA", "ScoringFGM", "ScoringFGA", 
+                             "PuntingPnt", "PuntingYds", "PuntingY_P", "PuntingLng"),
+               
+               new_names = c("Player", "Team", "KCK_XPM", "KCK_XPA", "KCK_FGM", "KCK_FGA",
+                             "PNT_PNT", "PNT_YDS", "PNT_YPP", "PNT_LNG")
+    )
+    tryCatch({
+    #Structure the bullshit that pops out
+    tb1 <- data$kicking
+    colnames(tb1) <- gsub(" ", "_", gsub("[[:punct:]]", "_", paste0(colnames(tb1), as.character(unname(tb1[1,])))))
+    tb1 <- tb1[-1,]
+    #Fix the names
+    colnames(tb1) <- name_conversion$new_names[match(colnames(tb1), name_conversion$old_names)]
+    
+    #Rbind fill into the pre-made dataframe
+    rbind.fill(
+      as.data.frame(
+        matrix(NA, nrow = 0, ncol = nrow(name_conversion), 
+               dimnames = list(NULL, as.character(name_conversion$new_names)))
+      ),
+      tb1) %>%
+      #Get rid of the splits and transform the names of players
+      filter(Player %in% c("",  'Player') == FALSE) %>%
+      rowwise() %>%
+      mutate(player = clean_player_names(Player)) %>%
+      as.data.frame %>%
+      #Transform to numeric from character
+      mutate_at(vars(-player, -Team, -Player), as.numeric) %>%
+      mutate(KCK_Player = Player) %>%
+      dplyr::select(-one_of('Player'))
+    
+  }, error = function(e) {} )
+}
+
+merge_list_function <- function(list_element, vars) {
+  #Count the number of nulls
+  null_cnt <- mapply(is.null, list_element)
+  
+  #Remove the nulls
+  non_null <- which(null_cnt == FALSE)
+  
+  #If they all NULL; do nothing
+  if(length(non_null) == 0) {} else {
+    #If there is only 1 non null return it
+    if(length(non_null) == 1) {
+      list_element[[non_null]]
+    } else {
+      list_element <- list_element[non_null]
+      comb <- list_element[[1]]
+      for(i in 2:length(list_element)) {
+        comb <- 
+          merge(x = comb,
+                y = list_element[[i]],
+                by = vars,
+                all = TRUE)
+      }
+      return(comb)
+    }
+  }
+}
+
+#Function to aggregate and compile all player stats
+compile_player_stats <- function(data, season) {
+  
+  tryCatch({merge_list_function(
+  list_element = list(
+    structure_player_offense(data),
+    structure_player_defense(data),
+    structure_kicking(data),
+    structure_returns(data)
+  ),
+  vars = c("player", "Team")) %>%
+    mutate(Team = pfr_teamnames$Team_ID[match(paste(Team, season, sep = '_'),
+                                              paste(pfr_teamnames$Team_ABB, pfr_teamnames$Season, sep = '_'))],
+           Season = season)
+  }, error = function(e) {} )
+    
+}
+
+#Function to compile the game stats
+compile_game_stats <- function(data, season) {
+  tryCatch({
+    structure_team_stats(data, season) %>%
+    left_join(structure_quarterly_scores(data),
+              by = 'Team') %>%
+    mutate(Season = season)
+  }, error = function(e) {} )
+}
+
+structure_starters <- function(data) {
+  tryCatch({
+    #Define the two list names
+    list_names <- c("vis_starters", "home_starters")
+    home_away <- c("Away", "Home")
+    
+    do.call("rbind", lapply(1:length(list_names), function(x) {
+      data[[list_names[x]]] %>%
+        rowwise() %>%
+        mutate(player = clean_player_names(Player)) %>%
+        as.data.frame %>%
+        mutate(Home_Away = home_away[x])
+    }))
+  }, error = function(e) {} )
+}
+
+#Create the function that will do it all in one sweet given the url
+scrape_pfr_data <- function(url, season, week) {
+  tryCatch({
+    raw_data <- compile_game_info(url)
+    game_data <- tryCatch({ compile_game_stats(raw_data, season) %>%
+      mutate(Week = week) }, error = function(e) {} )
+    player_data <- tryCatch({ compile_player_stats(raw_data, season) %>%
+      mutate(Week = week) }, error = function(e) {} )
+    misc_data <- tryCatch({
+      structure_game_info(raw_data) %>%
+      mutate(Game_Date_Time = tryCatch({ structure_text(raw_data) }, error = function(e) {} ),
+             Home_Team = tryCatch({ game_data %>% filter(Home_Away == 'Home') %>% .$Team }, error = function(e) {} ),
+             Away_Team = tryCatch({ game_data %>% filter(Home_Away == 'Away') %>% .$Team }, error = function(e) {} ),
+             Season = season,
+             Week = week) }, error = function(e) {} )
+    
+    starter_data <- tryCatch({ structure_starters(raw_data) %>%
+        mutate(Season = season,
+               Week = week,
+               Team = game_data$Team[match(Home_Away, game_data$Home_Away)])
+    }, error = function(e) {} )
+      
+    clean_data <- list(
+      GAME = game_data,
+      PLAYER = player_data,
+      MISC = misc_data,
+      STARTERS = starter_data
+    )
+    return(clean_data)
+  }, error = function(e) {} )
+}
+
+###########################################################################################################
+# Aggregation | Season/Week Stuff
+###########################################################################################################
+
+#Define a function to identify the sub-links that you wish to iterate through
+find_box_sublinks <- function(x) {
+  ifelse(grepl('/boxscores/', x, fixed = TRUE) == TRUE &
+           grepl('.htm', x, fixed = TRUE) == TRUE &
+           grepl('game-scores', x, fixed = TRUE) == FALSE, 1, 0)
+}
+
+#Function to grab all of the box score links for a given Season/Week
+find_boxscores <- function(season, week) {
+  root <- 'http://www.pro-football-reference.com'
+  
+  pg <-
+    read_html(paste0(root, '/years/', season, '/week_', week, '.htm')) %>%
+    html_nodes("a") %>%
+    html_attr("href") %>%
+    as.data.frame
+  
+  paste0(root, as.character(pg[which(find_box_sublinks(pg[,1]) == 1),]))
+  
+}
+
+#Function that will scrape and compile all weekly information
+scrape_compile_weekly <- function(season, week) {
+  tryCatch({
+    boxes <- find_boxscores(season, week)
+    bigList <- lapply(1:length(boxes), function(x) {
+      scrape_pfr_data(url = boxes[x], season = season, week = week)
+    })
+    comb_list <-
+      list(
+        GAME_STATS = bigList %>% map(1) %>% invoke(rbind.fill, .) %>%
+          mutate(Team_Season_Week = paste(Team, Season, Week, sep = '_')),
+        PLAYER_STATS = bigList %>% map(2) %>% invoke(rbind.fill, .) %>%
+          mutate(Team_Season_Week = paste(Team, Season, Week, sep = '_')),
+        MISC_STATS = bigList %>% map(3) %>% invoke(rbind.fill, .) %>%
+          mutate(Home_Away_Season_Week = paste(Home_Team, Away_Team, Season, Week, sep = '_')),
+        STARTERS = bigList %>% map(4) %>% invoke(rbind.fill, .) %>%
+          mutate(Team_Season_Week = paste(Team, Season, Week, sep = '_'))
+      )
+    return(comb_list)
+  }, error = function(e) {} )
+}
+
+#Create the function that will scrape all of the PFR data for a given
+#Season and week, and import the missing data into MongoDB
+scrape_store_pfr <- function(season, week) {
+  #Scrape the data
+  data <- scrape_compile_weekly(season, week)
+  
+  #Create the data frame of table names and ids
+  index_df <- data.frame(
+    table_names = c('GAME_STATS', 'PLAYER_STATS', 'MISC_STATS', 'STARTERS'),
+    table_ids = c('Team_Season_Week', 'Team_Season_Week', 'Home_Away_Season_Week', 'Team_Season_Week'),
+    stringsAsFactors = FALSE
+  )
+  
+  for(i in 1:nrow(index_df)) {
+    #Establish connection to mongodb
+    username <- 'thatsmrlongcut'
+    password <- 'football17'
+    
+    con <-
+      mongo(
+        collection = "NFL",
+        db = paste0("PFR_", index_df$table_names[i]),
+        url = paste0("mongodb+srv://", username, ":", password, '@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+      )
+    
+    #Grab all of the unique identifiers
+    ids <- con$distinct(index_df$table_ids[i], query = '{}')
+    
+    #Filter out ids that are found in the database already
+    missing_df <- 
+      tryCatch({
+        data[[index_df$table_names[i]]] %>%
+          filter((!!sym(index_df$table_ids[i])) %in% ids == FALSE)
+      }, error = function(e) {} )
+    
+    #If there is data in the missing -- import it, if not move on
+    if(is.null(missing_df)) {
+      rm(con)
+      print(paste0(index_df$table_names[i], ' : ', 'No new data, not importing any rows'))
+    } else {
+      con$insert(missing_df)
+      rm(con)
+      print(paste0(index_df$table_names[i], ' : ', 'Importing ', nrow(missing_df), ' records'))
+    }
+  }
+}
+
+###########################################################################################################
+# Football Outsiders pull
+###########################################################################################################
+
+login_fo <- function() {
+  #Go to the Football Outsiders log-in page
+  remDr$navigate("https://www.footballoutsiders.com/user/login?destination=home")
+  
+  #Send username
+  username <- remDr$findElement(using = "id", value = "edit-name")
+  username$clearElement()
+  username$sendKeysToElement(list("thankscyalater"))
+  
+  #Send password and Enter
+  passwd <- remDr$findElement(using = "id", value = "edit-pass")
+  passwd$clearElement()
+  passwd$sendKeysToElement(list("football17", "\uE007"))
+}
+
+fo_char_to_num <- function(num) {
+  as.numeric(paste(gsub("%", "", paste(num))))
+}
+
+fo_scrape_week <- function(season, week) {
+  url <- paste0('https://www.footballoutsiders.com/premium/dvoa-specific-week?year=', season, '&week=', week, '&offense_defense=offense')
+  remDr$navigate(url)
+  page <- remDr$getPageSource()
+  
+  tryCatch({
+  #Scrape the table
+  tb1 <-
+    page[[1]] %>%
+    read_html() %>%
+    html_table()
+  tb1 <- tb1[[1]]
+  
+  #Rename the columns
+  colnames(tb1) <- gsub("[[:punct:]]", "_", gsub(" ", "_", toupper(colnames(tb1))))
+  
+  #Make unique column names
+  for(i in 1:ncol(tb1)) {
+    if(colnames(tb1)[i] == 'RANK') {
+      colnames(tb1)[i] <- paste(colnames(tb1)[(i-1)], colnames(tb1)[i], sep = '_')
+    }
+  }
+  
+  #Remove '%' from numeric columns and transform into true numerics
+  tb1 %>%
+    dplyr::select(-one_of('W_L')) %>%
+    #Team to a factor to save it from the function
+    mutate(TEAM = as.factor(TEAM)) %>%
+    mutate_if(is.character, fo_char_to_num) %>%
+    as.data.frame %>%
+    mutate(Team = paste(fo_teamnames$Team_ID[match(paste(TEAM, season, sep = '_'), paste(fo_teamnames$FO_Name, fo_teamnames$Season, sep = '_'))]),
+           Season = season,
+           Week = week,
+           Season_Week_Team = paste(Season, Week, Team, sep = '_')) %>%
+    dplyr::select(-one_of('TEAM'))
+  }, error = function(e) {} )
+}
+
+fo_weekly_scrape_store <- function(season, week) {
+  #Start automated browser
+  start_selenium()
+  
+  #Log in to Football Outsiders
+  login_fo()
+  
+  #Scrape the week
+  df <- fo_scrape_week(season, week)
+  
+  #Establish connection to the mongodb table
+  con <-
+    mongo(
+      collection = "NFL",
+      db = 'FO_DVOA',
+      url = paste0('mongodb+srv://thatsmrlongcut:football17@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+    )
+  
+  #Grab all of the unique identifiers
+  ids <- con$distinct('Season_Week_Team', query = '{}')
+  
+  #Filter out ids that are found in the database already
+  missing_df <- 
+    df %>%
+    filter(Season_Week_Team %in% ids == FALSE)
+  
+  #If there is data in the missing -- import it, if not move on
+  if(is.null(missing_df)) {
+    rm(con)
+    print('No new data, not importing any rows')
+  } else {
+    con$insert(missing_df)
+    rm(con)
+    print(paste0('Importing ', nrow(missing_df), ' records'))
+  }
+  
+  #Close the automated browser
+  remDr$close()
+}
+
+#Function to scrape FO weekly spread picks
+fo_weekly_picks_scrape <- function() {
+  #Log in to Football Outsiders
+  start_selenium()
+  login_fo()
+  
+  #Go to the page
+  remDr$navigate('http://www.footballoutsiders.com/premium/picks')
+  page <- remDr$getPageSource()
+  
+  #Scrape the tables
+  tbl <-
+    page[[1]] %>%
+    read_html(xpath = '//*[@id="node-62521"]') %>%
+    html_table(fill = TRUE)
+  
+  #Scrape the text
+  txt <-
+    page[[1]] %>%
+    read_html() %>%
+    html_text()
+  
+  #Find the week
+  find_week <- str_locate_all(txt, 'Week ')[[1]]
+  
+  loc <-
+    which(
+      do.call("c", lapply(1:nrow(find_week), function(x) {
+        grepl("2019", substr(txt, find_week[x,1] - 15, find_week[x,1] + 15))
+      })) == TRUE)
+  
+  week <- gsub("Week ", "", gsub("[\n]", "", gsub("[[:punct:]]", "", substr(txt, find_week[loc,1], find_week[loc,1] + 12))))
+  
+  #Structure the season week
+  season_week <- cbind.data.frame(Season = strsplit(week, " ")[[1]][2], 
+                                  Week = strsplit(week, " ")[[1]][1])
+  
+  #Structure the data table
+  df <- tbl[[1]]
+  colnames(df) <- df[1,]
+  df <- df[-1,]
+  
+  #Fix column names
+  match_cols <- c('HOME', 'AWAY', 'LINE (HOME)', 'SPREAD PICK')
+  new_cols <- c('Home_Team', 'Away_Team', 'SPREAD', 'FO_Pick')
+  
+  for(i in 1:ncol(df)) {
+    colnames(df)[i] <- new_cols[match(colnames(df)[i], match_cols)]
+  }
+  
+  #Fix spreads
+  df$SPREAD <- gsub("[*]", "", df$SPREAD)
+  
+  df$SPREAD <-
+    do.call("c", lapply(1:nrow(df), function(x) {
+      if(df$SPREAD[x] == 'PICK') {
+        0
+      } else {
+        as.numeric(df$SPREAD[x])
+      }
+    }))
+  
+  #Fix the picks
+  df$FO_Pick <- gsub("[*]", "", df$FO_Pick)
+  
+  #Select only the columns to keep and filter out bad vars and add in the season
+  df <- 
+    df[,new_cols] %>%
+    filter(FO_Pick != 'NO PICK') %>%
+    as.data.frame %>%
+    mutate(Season = season_week$Season[1],
+           Week = season_week$Week[1],
+           Home_Team = fo_teamnames$Team_ID[match(paste(Home_Team, Season, sep = '_'),
+                                                  paste(fo_teamnames$FO_Name, fo_teamnames$Season, sep = '_'))],
+           Away_Team = fo_teamnames$Team_ID[match(paste(Away_Team, Season, sep = '_'),
+                                                  paste(fo_teamnames$FO_Name, fo_teamnames$Season, sep = '_'))],
+           FO_Pick = fo_teamnames$Team_ID[match(paste(FO_Pick, Season, sep = '_'),
+                                                paste(fo_teamnames$FO_Name, fo_teamnames$Season, sep = '_'))],
+           Season_Week_Home = paste(Season, Week, Home_Team, sep = '_'))
+  
+  
+  #Establish connection to the mongodb table
+  con <-
+    mongo(
+      collection = "NFL",
+      db = 'FO_SPREAD_PICKS',
+      url = paste0('mongodb+srv://thatsmrlongcut:football17@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+    )
+  
+  #Grab all of the unique identifiers
+  ids <- con$distinct('Season_Week_Home', query = '{}')
+  
+  #Filter out ids that are found in the database already
+  missing_df <- 
+    df %>%
+    filter(Season_Week_Home %in% ids == FALSE)
+  
+  #If there is data in the missing -- import it, if not move on
+  if(is.null(missing_df)) {
+    rm(con)
+    print('No new data, not importing any rows')
+  } else {
+    con$insert(missing_df)
+    rm(con)
+    print(paste0('Importing ', nrow(missing_df), ' records'))
+  }
+}
+
+###########################################################################################################
+# Pro Football Focus (PFF)
+###########################################################################################################
+
+#Function to log in to pro football focus
+pff_login <- function() {
+  pff_login_url <- "http://www.profootballfocus.com/amember/login?amember_redirect_url=%2Fauth%2Ftokenize%3Freturn_url%3Dhttps%3A%2F%2Fwww.profootballfocus.com%2Fauth_callback"
+  pff_staging_url <- "https://www.pff.com/amember/login?amember_redirect_url=%2Fauth%2Ftokenize%3Freturn_url%3Dhttps%3A%2F%2Fwww.profootballfocus.com%2Fauth_callback"
+  #Go to log in page
+  #un = sweetmango
+  #pw = yyh123yyh
+  start_selenium()
+  remDr <- rD$client
+  remDr$navigate(pff_login_url)
+  
+  #Do the captcha bitch
+  while(remDr$getCurrentUrl()[[1]] == pff_staging_url) {
+    Sys.sleep(10)
+  }
+}
+
+#Create the base skeleton game scrape
+pff_box <- function(season, week) {
+  tryCatch({
+    #Pro Football Focus (PFF) Premium Stats data scrape
+    #Establish the root url
+    root <- "https://premium.profootballfocus.com/api/v1/"
+    #Create the API url based on the week/season
+    url <- paste0(root, 'games?week=', week, '&season=', season, '&league=nfl')
+    
+    content <- read_html(url) %>%
+      html_node("p") %>% 
+      html_text()
+    
+    data <- fromJSON(content)
+    #Output the data
+    data <-
+      data$games %>%
+      #filter for has stats
+      filter(has_stats == TRUE)
+    
+    #Structure accordingly
+    ha_teams <- c("home_team", "away_team")
+    
+    cbind.data.frame(
+      data[, c("id", "season", "week")],
+      do.call("cbind.data.frame", lapply(1:length(ha_teams), function(i) {
+        data[[ha_teams[i]]] %>%
+          dplyr::select(one_of('franchise_id')) %>%
+          setNames(paste(ha_teams[i], names(.), sep = '_'))
+      })) %>%
+        mutate(home_team = pff_teamnames$Team_ID[match(home_team_franchise_id, pff_teamnames$Franchise_ID)],
+               away_team = pff_teamnames$Team_ID[match(away_team_franchise_id, pff_teamnames$Franchise_ID)]) %>%
+        dplyr::select(-one_of('home_team_franchise_id', 'away_team_franchise_id'))
+    )
+  }, error = function(e) {} )
+}
+
+#Function to structure the offensive grades
+pff_offense <- function(game_id) {
+  tryCatch({
+    url <- paste0('https://premium.profootballfocus.com/api/v1/facet/offense/summary?game_id=', game_id)
+    remDr$navigate(as.character(url))
+    page <- remDr$getPageSource()
+    
+    
+    content <- read_html(page[[1]]) %>% 
+      html_text()
+    data <- fromJSON(content)
+    data <- data[[1]]
+    
+    cbind.data.frame(
+      data %>%
+        dplyr::select(one_of(c('franchise_id', 'jersey_number', 'player', 'player_id', 'position', 'status'))),
+      data[["grades"]] %>%
+        dplyr::select(grade = offense),
+      data[["snap_counts"]] %>%
+        dplyr::select(snap_count = total)
+    ) %>%
+      mutate(stat_type = 'offense')
+  }, error = function(e) {} )
+}
+
+
+#Function to structure the defensive grades
+pff_defense <- function(game_id) {
+  tryCatch({
+    url <- paste0('https://premium.profootballfocus.com/api/v1/facet/defense/summary?game_id=', game_id)
+    remDr$navigate(as.character(url))
+    page <- remDr$getPageSource()
+    
+    
+    content <- read_html(page[[1]]) %>% 
+      html_text()
+    data <- fromJSON(content)
+    data <- data[[1]]
+    
+    cbind.data.frame(
+      data %>%
+        dplyr::select(one_of(c('franchise_id', 'jersey_number', 'player', 'player_id', 'position', 'status'))),
+      data[["grades"]] %>%
+        dplyr::select(grade = defense),
+      data[["snap_counts"]] %>%
+        dplyr::select(snap_count = total)
+    ) %>%
+      mutate(stat_type = 'defense')
+  }, error = function(e) {} )
+}
+
+pff_special <- function(game_id) {
+  tryCatch({
+    url <- paste0('https://premium.profootballfocus.com/api/v1/facet/special/summary?game_id=', game_id)
+    remDr$navigate(as.character(url))
+    page <- remDr$getPageSource()
+    
+    
+    content <- read_html(page[[1]]) %>% 
+      html_text()
+    data <- fromJSON(content)
+    data <- data[[1]] %>%
+      filter(position %in% c("K", "P"))
+    
+    cbind.data.frame(
+      data %>%
+        dplyr::select(one_of(c('franchise_id', 'jersey_number', 'player', 'player_id', 'position', 'status'))),
+      data[["grades"]] %>%
+        dplyr::select(punter, kicker = fgep_kicker),
+      data[["snap_counts"]] %>%
+        dplyr::select(punt_coverage, field_goal)
+    ) %>%
+      mutate(stat_type = 'special',
+             grade = ifelse(position == 'K', kicker, punter),
+             snap_count = ifelse(position == 'K', field_goal, punt_coverage)) %>%
+      dplyr::select(-one_of(c('kicker', 'punter', 'field_goal', 'punt_coverage')))
+  }, error = function(e) {} )
+}
+
+#Function to compile offense, defense, and special teams
+pff_stats <- function(game_id) {
+  tryCatch({
+    game_stats <- list(
+      offense = pff_offense(game_id),
+      defense = pff_defense(game_id)
+    )
+    special <- pff_special(game_id)
+    
+    data <- do.call("rbind", plyr::compact(game_stats))
+    
+    #Select the row with the most snaps for each player in offense/defense
+    off_def <-
+      data %>%
+      group_by(franchise_id, player_id) %>%
+      summarise(
+        snap_count = max(snap_count)
+      ) %>%
+      as.data.frame %>%
+      left_join(
+        data,
+        by = c("franchise_id", "player_id", "snap_count")
+      )
+    
+    if(is.null(special)) {
+      off_def %>%
+        as.data.frame %>%
+        rowwise() %>%
+        mutate(player_name = player,
+               player = clean_player_names(player)) %>%
+        as.data.frame %>%
+        mutate(id = game_id)
+    } else {
+      rbind(
+        off_def %>%
+          filter(player_id %in% special$player_id == FALSE),
+        special
+      ) %>%
+        as.data.frame %>%
+        rowwise() %>%
+        mutate(player_name = player,
+               player = clean_player_names(player)) %>%
+        as.data.frame %>%
+        mutate(id = game_id)
+    }
+  }, error = function(e) {} )
+}
+
+pff_scrape_week <- function(season, week) {
+  tryCatch({
+    week_info <- pff_box(season, week)
+    
+    do.call("rbind", plyr::compact(
+      lapply(1:nrow(week_info), function(i) {
+        pff_stats(week_info$id[i])
+      }))) %>%
+      left_join(week_info,
+                by = 'id') %>%
+      mutate(team = pff_teamnames$Team_ID[match(franchise_id, pff_teamnames$Franchise_ID)],
+             player_franchise_season_week_stat = paste(player_id, franchise_id, season, week, stat_type, sep = '_'))
+  }, error = function(e) {} )
+}
+
+#Functiont to run the scrape and storage of PFF's data
+pff_weekly_scrape_store <- function(season, week) {
+  #Start the automated browser and log in to pro football focus
+  pff_login()
+  
+  #Scrape the grades
+  df <- pff_scrape_week(season, week)
+  
+  #Establish connection to the mongodb table
+  con <-
+    mongo(
+      collection = "NFL",
+      db = 'PFF_GRADES',
+      url = paste0('mongodb+srv://thatsmrlongcut:football17@nfl-bsxce.mongodb.net/')
+    )
+  
+  #Grab all of the unique identifiers
+  ids <- con$distinct('player_franchise_season_week_stat', query = '{}')
+  
+  #Filter out ids that are found in the database already
+  missing_df <- 
+    df %>%
+    filter(player_franchise_season_week_stat %in% ids == FALSE)
+  
+  #If there is data in the missing -- import it, if not move on
+  if(is.null(missing_df)) {
+    rm(con)
+    print('No new data, not importing any rows')
+  } else {
+    con$insert(missing_df)
+    rm(con)
+    print(paste0('Importing ', nrow(missing_df), ' records'))
+  }
+  
+  #Close the automated browser
+  remDr$close()
+}
+
+#################################
+# Roster Scrape
+#################################
+
+#Function to structure the JSON output of the roster pull
+struct_roster <- function(.data) {
+  .data %>%
+    mutate(roster_status = status) %>%
+    dplyr::select(id, first_name, last_name, franchise_id, position, roster_status, depth)
+}
+
+#Function to navigate and structure the rosters
+nav_scrape_roster <- function(url) {
+  remDr$navigate(as.character(url))
+  page <- remDr$getPageSource()
+  
+  content <- 
+    read_html(page[[1]]) %>% 
+    html_text()
+  data <- fromJSON(content)
+  
+  data$positions %>%
+    map(1) %>%
+    plyr::compact(.) %>%
+    map(struct_roster) %>%
+    invoke(rbind, .)
+}
+
+#Function to scrape all of the rosters and combine
+launch_scrape_store_rosters <- function() {
+  #Launch selenium and log in to PFF
+  pff_login()
+  
+  #Navigate to the loading page after login
+  remDr$navigate(as.character('http://grades.pff.com/#/ratings/home'))
+  page <- remDr$getPageSource()
+  
+  #Root of the website
+  root <- 'http://grades.pff.com/api/'
+  
+  #Sub
+  sub_roots <- c('offenses', 'defenses')
+  
+  #Create all of the urls
+  all_urls <- 
+    do.call("c", lapply(1:32, function(i) {
+      do.call("c", lapply(1:length(sub_roots), function(x) {
+        paste0(root, sub_roots[x], '/depth_charts?team_id=', i)
+      }))
+    }))
+  
+  #Go to each url and scrape
+  current_roster <- 
+    do.call("rbind", lapply(1:length(all_urls), function(x) {
+      Sys.sleep(5)
+      nav_scrape_roster(all_urls[x])
+    })) %>%
+    mutate(Team = pff_teamnames$Team_ID[match(franchise_id, pff_teamnames$Franchise_ID)],
+           Datetime = now())
+  
+  #Establish connection with mongo db
+  con <-
+    mongo(
+      collection = "NFL",
+      db = "PFF_CURRENT_ROSTER",
+      url = paste0('mongodb+srv://thatsmrlongcut:football17@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+    )
+  con$insert(current_roster)
+  rm(con)
+  
+}
+
+#################################
+# PFF Greenline
+#################################
+
+#Function to find all the sublinks
+find_greenline_sublinks <- function(url) {
+  remDr$navigate(url)
+  page <- remDr$getPageSource()
+  
+  paste0('http://pff.com', 
+         page[[1]] %>%
+           read_html() %>%
+           html_nodes("a") %>%
+           html_attr("href") %>%
+           as.data.frame %>%
+           filter(grepl('/greenline/nfl/', .)) %>%
+           .$. %>%
+           as.character)
+}
+
+#Split the game into home/away
+home_away_spl <- function(link) {
+  link <- strsplit(link, '/')[[1]]
+  spl <- strsplit(last(link), "@")[[1]]
+  cbind.data.frame(Home_Team = spl[2], 
+                   Away_Team = spl[1],
+                   Season = link[match('nfl', link)+1],
+                   Week = link[match('nfl', link)+2])
+}
+
+
+#Find the probabilities
+greenline_probs <- function(page) {
+  betting_probability <-
+    page[[1]] %>%
+    read_html() %>%
+    html_nodes(xpath = "//div[@class='m-betting-probability']") %>%
+    html_text()
+  
+  betting_probs_df <-
+    as.data.frame(t(as.matrix(do.call("c", 
+                                      plyr::compact(lapply(1:length(betting_probability), function(i) {
+                                        if(grepl('cover Prob.', betting_probability[i])) {
+                                          look_first <- 'cover Prob.'
+                                          look_second <- '%'
+                                          
+                                          first_df <- str_locate_all(betting_probability[i], look_first)[[1]]
+                                          second_df <- str_locate_all(betting_probability[i], look_second)[[1]]
+                                          
+                                          do.call("c", lapply(1:2, function(x) {
+                                            as.numeric(substr(betting_probability[i], start = first_df[x,2] + 1, stop = second_df[x,1] - 1))
+                                          }))
+                                        }
+                                      }))))))
+  
+  
+  colnames(betting_probs_df) <- c('Home_Team_Spread_Coverage', 'Away_Team_Spread_Coverage', 'Under_Coverage', 'Over_Coverage')
+  betting_probs_df
+}
+
+#Find the game point lines
+game_point_prediction <- function(page) {
+  classes <- c('m-betting-data__item m-betting-data__item--greenline', 'm-betting-data__item m-betting-data__item--market')
+  
+  line_predictions_df <-
+    as.data.frame(
+      t(
+        as.matrix(
+          do.call("c", lapply(1:length(classes), function(x) {
+            value <- 
+              gsub("Market", "", 
+                   page[[1]] %>%
+                     read_html() %>%
+                     html_nodes(xpath = paste0("//div[@class='", classes[x], "']")) %>%
+                     html_text())
+            if(length(value) == 0) { value <- 0}
+            value
+          })))))
+  
+  colnames(line_predictions_df) <- c('Greenline_Game_Points', 'Market_Game_Points')
+  line_predictions_df
+}
+
+#Find the point predictions
+game_differential_prediction <- function(page) {
+  classes <- c('m-betting-chart__bar m-betting-chart__bar--greenline', 'm-betting-chart__bar m-betting-chart__bar--market')
+  prefix <- c('GREENLINE_', 'MARKET_')
+  do.call("cbind.data.frame", lapply(1:length(classes), function(x) {
+    idf <-
+      page[[1]] %>%
+      read_html() %>%
+      html_nodes(xpath = paste0("//div[@class='", classes[x], "']")) %>%
+      html_text()
+    
+    idf <-
+      data.frame(LINE = gsub("Market", "", if(idf[1] == "") { idf[2] } else { idf[1] }),
+                 FAVORED = ifelse(idf[1] == "", 'HOME', 'AWAY'), stringsAsFactors = FALSE)
+    colnames(idf) <- paste0(prefix[x], colnames(idf))
+    idf
+  }))
+}
+
+#Find the date time
+date_time <- function(page) {
+  idf <-
+    page[[1]] %>%
+    read_html() %>%
+    html_nodes(xpath = paste0("//div[@class='", 'm-gl-game-details__section', "']")) %>%
+    html_text()
+  idf <-
+    page[[1]] %>%
+    read_html() %>%
+    html_nodes(xpath = paste0("//div[@class='", 'm-gl-game-details__section', "']")) %>%
+    html_text()
+  idf1 <- idf[grepl(month.name[month(now()+1000000)], idf, ignore.case = TRUE)]
+  if(length(idf1) == 0) { idf1 <- idf[grepl(month.name[month(now())], idf, ignore.case = TRUE)] }
+  
+  data.frame(Game_Date_Time = as.POSIXct(strptime(gsub("\\s+", " ", gsub("[^[:alnum:][:blank:]+:?&/\\-]", "", idf1)), format = '%A %B %d %Y %I:%M %p')))
+}
+
+#Function to scrape all of the NFL Greenline information
+pff_greenline <- function() {
+  #Log in to PFF.com
+  pff_login()
+  
+  #Grab all the sublinks
+  sub_links <- unique(find_greenline_sublinks('http://www.pff.com/greenline/nfl'))
+  
+  #Grab the team names
+  pff_teamnames2 <-
+    mongo(
+      collection = "NFL",
+      db = "PFF_TEAM_NAMES2",
+      url = paste0('mongodb+srv://thatsmrlongcut:football17@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+    )$find()
+  
+  #Scrape the lines
+  pff_greenline_df <-
+    do.call("rbind", lapply(1:length(sub_links), function(i) {
+      remDr$navigate(sub_links[i])
+      page <- remDr$getPageSource()
+      
+      cbind.data.frame(home_away_spl(sub_links[i]),
+                       greenline_probs(page),
+                       game_point_prediction(page),
+                       game_differential_prediction(page),
+                       date_time(page)) %>%
+        mutate(Under_Coverage = ifelse(is.na(Under_Coverage), 50, as.numeric(Under_Coverage)),
+               Over_Coverage = ifelse(is.na(Over_Coverage), 50, as.numeric(Over_Coverage)))
+    })) %>%
+    mutate(Home_Team = pff_teamnames2$TEAM_ID[match(Home_Team, pff_teamnames2$TEAM_NAME)],
+           Away_Team = pff_teamnames2$TEAM_ID[match(Away_Team, pff_teamnames2$TEAM_NAME)],
+           Timestamp = now())
+  
+  #Insert the lines
+  con <-
+    mongo(
+      collection = "NFL",
+      db = "PFF_GREENLINE",
+      url = paste0('mongodb+srv://thatsmrlongcut:football17@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+    )
+  con$insert(pff_greenline_df)
+  rm(con)
+}
+
+#################################
+# Bovada Line Scrape
+#################################
+
+scrape_bovada <- function() {
+  #Start selneium browser
+  start_selenium()
+  
+  #Navigate to the football odds page
+  remDr$navigate('http://www.bovada.lv/sports/football/nfl')
+  page <- remDr$getPageSource()
+  
+  #Scrape the text
+  txt <-
+    page[[1]] %>%
+    read_html() %>%
+    html_text()
+  
+  #Remove unnecessary text
+  txt <- substr(txt, start = str_locate_all(txt, 'NFLSpreadWinTotal ')[[1]][1,2]+1, stop = str_locate_all(txt, ' Bet SlipOpen')[[1]][1,1]-1)
+  txt <- gsub("  ", " ", txt)
+  txt <- strsplit(txt, " ")[[1]]
+  
+  #Find the indexor
+  index_find <- which(txt == "PM")
+  
+  #Set up the locations of the indexes
+  index_df <- 
+    matrix(index_find, ncol = 2, byrow = TRUE, dimnames = list(1:(length(index_find)/2), c('P1', 'P2'))) %>%
+    as.data.frame %>%
+    mutate(dif = lead(P2-shift(P2)),
+           F1 = 3+(dif-21),
+           F2 = P2 + F1 + 1,
+           F3 = lead(P1)-index_find[1],
+           #Fix the last row
+           F3 = ifelse(is.na(F3), length(txt), F3),
+           F2 = ifelse(is.na(F2), F3-10, F2),
+           F1 = ifelse(is.na(F1), F2-P2-1, F1))
+  
+  #Structure into a matrix
+  idf <-
+    do.call("rbind", 
+            lapply(1:nrow(index_df), function(i) {
+              c(txt[(index_df$P1[i] + 2):index_df$P2[i]],
+                paste(txt[(index_df$P2[i] + 1):(index_df$P2[i] + index_df$F1[i])], collapse = ' '),
+                txt[index_df$F2[i]:index_df$F3[i]]
+              )
+            }))
+  
+  #Structure accordingly
+  df <-
+    cbind.data.frame(
+      Game_Date_Time = do.call("c", 
+                               lapply(1:nrow(idf), function(x) {
+                                 as.POSIXct(strptime(paste(idf[x, 1:3], collapse = ' '), format = '%m/%d/%y %I:%M %p'))
+                               })),
+      
+      do.call("rbind", 
+              lapply(1:nrow(idf), function(z) {
+                char_spl <- strsplit(idf[z,4], " ")[[1]]
+                cap_cnt <- do.call("c", lapply(1:length(char_spl), function(x) {
+                  length(str_match_all(char_spl[x], "[A-Z]")[[1]]) + length(str_match_all(char_spl[x], "[0-9]")[[1]])
+                }))
+                middle_spl <- strsplit(str_trim(gsub('([[:upper:]])', ' \\1', char_spl[which.max(cap_cnt)])), " ")[[1]]
+                
+                Away_Team <- pfr_dirtyteamnames$Team_ID[match(paste(c(char_spl[1:(which.max(cap_cnt) - 1)], middle_spl[1]), collapse = ' '), pfr_dirtyteamnames$Dirty_Name)]
+                Home_Team <- pfr_dirtyteamnames$Team_ID[match(paste(c(middle_spl[2], char_spl[(which.max(cap_cnt) + 1):length(char_spl)]), collapse = ' '), pfr_dirtyteamnames$Dirty_Name)]
+                
+                cbind.data.frame(Away_Team, Home_Team)
+              })),
+      cbind.data.frame(
+        Away_Team_Spread = as.numeric(idf[,6]),
+        Home_Team_Spread = as.numeric(idf[,8])
+      ),
+      cbind.data.frame(
+        Away_Team_Spread_Odds = as.numeric(gsub('EVEN', '+100', gsub('[()]', "", idf[,7]))),
+        Home_Team_Spread_Odds = as.numeric(gsub('EVEN', '+100', gsub('[()]', "", idf[,9])))
+      ),
+      cbind.data.frame(
+        Away_Team_ML_Odds = as.numeric(gsub('EVEN', '+100', gsub('[()]', "", idf[,10]))),
+        Home_Team_ML_Odds = as.numeric(gsub('EVEN', '+100', gsub('[()]', "", idf[,11])))
+      ),
+      cbind.data.frame(
+        Over_Under = as.numeric(gsub('O', '', idf[,12]))
+      ),
+      cbind.data.frame(
+        Over_Odds = as.numeric(gsub('EVEN', '+100', gsub('[()]', "", idf[,13]))),
+        Under_Odds = as.numeric(gsub('EVEN', '+100', gsub('[()]', "", idf[,15])))
+      )
+    ) %>%
+    mutate(Timestamp = now())
+  
+  #Load into mongodb
+  con <-
+    mongo(
+      collection = "NFL",
+      db = "BOVADA_LINES",
+      url = paste0('mongodb+srv://thatsmrlongcut:football17@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+    )
+  con$insert(df)
+  rm(con)
+  
+  #Close the automated browser
+  remDr$close()
+}
+
+#################################
+# Nitrogen Line Scrape
+#################################
+
+#Create a function to slowly input the characters
+slow_input <- function(text, key, login) {
+  #Split the text
+  split_text <- strsplit(text, "")[[1]]
+  
+  #Find the element
+  elem <- remDr$findElement(using = "id", value = key)
+  elem$clearElement()
+  
+  #Send keys slowly
+  for(i in 1:length(split_text)) {
+    elem$sendKeysToElement(list(split_text[i]))
+    Sys.sleep(runif(1, min = .001, max = 3))
+  }
+  
+  if(login == TRUE) {
+    elem$sendKeysToElement(list("\uE007"))
+  }
+}
+
+#Function to scrape all the required text tables
+get_nitrogen_data <- function(page) {
+  classes <- c('event-participants span8',
+               'event-time span4',
+               'event-participant span6',
+               'event-odds span4')
+  
+  lapply(1:length(classes), function(x) {
+    page[[1]] %>%
+      read_html() %>%
+      html_nodes(xpath = paste0('//div[@class="', classes[x], '"]')) %>%
+      html_text()
+  })
+}
+
+#Function to gather the spread lines
+gather_spread_lines <- function(spread_blob) {
+  sp_bl <- strsplit(spread_blob, " ")[[1]]
+  cbind.data.frame(
+    VALUE = as.numeric(sp_bl[seq(from = 1, to = length(sp_bl), by = 3)]),
+    ODDS = as.numeric(gsub("[()]", "", sp_bl[seq(from = 3, to = length(sp_bl), by = 3)]))
+  )
+}
+
+#Function to gather the spread lines
+gather_money_lines <- function(spread_blob) {
+  sp_bl <- strsplit(spread_blob, " ")[[1]]
+  cbind.data.frame(
+    ODDS = as.numeric(gsub("[()]", "", sp_bl[seq(from = 3, to = length(sp_bl), by = 3)]))
+  )
+}
+
+#Function to scrape nitrogen
+scrape_nitrogen <- function() {
+  #Start the automated port
+  start_selenium()
+  
+  #Navigate to nitrogen sportsbook
+  remDr$navigate('http://nitrogensports.eu/sport/football/nfl')
+  Sys.sleep(10)
+  
+  #Click existing account
+  account <- remDr$findElement(using = "id", value = "modal-welcome-login-button")
+  account$clickElement()
+  Sys.sleep(3)
+  
+  #Establish credentials
+  credentials <- list(
+    UN = "thatsmrlongcut",
+    PW = "Numbers14:19"
+  )
+  
+  #Login to existing account
+  slow_input(credentials$UN, "modal-account-login-username-textbox", FALSE)
+  slow_input(credentials$PW, "modal-account-login-password-textbox", TRUE)
+  Sys.sleep(10)
+  
+  #Go to the page
+  page <- remDr$getPageSource()
+  
+  #Grab the data
+  data <- get_nitrogen_data(page)
+  
+  #Structure the home/away teams
+  games <- 
+    do.call("rbind", 
+            plyr::compact(
+              lapply(1:length(data[[1]]), function(x) {
+                cln <- str_trim(gsub("\\s+", " ", gsub("[\n\t]", " ", data[[1]][x])))
+                #If there is no ' vs ' in the string, skip it
+                if(grepl(' vs ', cln) == FALSE) {} else {
+                  vs_spl <- strsplit(cln, ' vs ')[[1]]
+                  cbind.data.frame(
+                    Home_Team = pfr_dirtyteamnames$Team_ID[match(vs_spl[2], pfr_dirtyteamnames$Dirty_Name)],
+                    Away_Team = pfr_dirtyteamnames$Team_ID[match(vs_spl[1], pfr_dirtyteamnames$Dirty_Name)]
+                  )
+                }
+              })))
+  
+  #Structure the dates
+  dates <- 
+    do.call("c", lapply(1:length(data[[2]]), function(x) {
+      as.POSIXct(strptime(str_trim(gsub("\\s+", " ", gsub("[\n\t]", " ", data[[2]][x]))), format = '%A, %B %d, %Y %I:%M%p'))
+    }))
+  
+  #Structure the layout
+  lyout <- do.call("c", 
+                   lapply(1:length(data[[3]]), function(x) {
+                     cln <- str_trim(gsub("\\s+", " ", gsub("[\n\t]", " ", data[[3]][x])))
+                     cln_spl <- strsplit(cln, " ")[[1]]
+                     paste(cln_spl[1:(match("BTC", cln_spl)-2)], collapse = " ")
+                   }))
+  
+  #Grab the lines
+  lines <- 
+    do.call("c", 
+            lapply(1:length(data[[4]]), function(x) {
+              str_trim(gsub("[)]", ") ", str_trim(gsub("\\s+", " ", gsub("[\n\t]", " ", data[[4]][x])))))
+            }))
+  
+  #Structure the spreads
+  away_seq <- seq(from = 1, to = length(lines), by = 6)
+  home_seq <- away_seq + 1
+  
+  spreads <-
+    rbind(
+      do.call("rbind", 
+              lapply(1:length(away_seq), function(x) {
+                gather_spread_lines(lines[away_seq[x]]) %>%
+                  mutate(BET_ON = games$Away_Team[x],
+                         HOME_AWAY = 'AWAY',
+                         BET_TYPE = "SPREAD",
+                         GAME_DT_TIME = dates[x],
+                         GAME_ID = paste(games$Home_Team[x], BET_ON, sep = '_'))
+              })),
+      do.call("rbind", 
+              lapply(1:length(home_seq), function(x) {
+                gather_spread_lines(lines[home_seq[x]]) %>%
+                  mutate(BET_ON = games$Home_Team[x],
+                         HOME_AWAY = 'HOME',
+                         BET_TYPE = "SPREAD",
+                         GAME_DT_TIME = dates[x],
+                         GAME_ID = paste(BET_ON, games$Away_Team[x], sep = '_'))
+              }))
+    )
+  
+  #Structure the moneylines
+  away_seq <- seq(from = 3, to = length(lines), by = 6)
+  home_seq <- away_seq + 1
+  
+  MLs <-
+    rbind(
+      do.call("rbind", 
+              lapply(1:length(away_seq), function(x) {
+                gather_money_lines(lines[away_seq[x]]) %>%
+                  mutate(BET_ON = games$Away_Team[x],
+                         HOME_AWAY = 'AWAY',
+                         BET_TYPE = "MONEY_LINE",
+                         GAME_DT_TIME = dates[x],
+                         GAME_ID = paste(games$Home_Team[x], BET_ON, sep = '_'))
+              })),
+      do.call("rbind", 
+              lapply(1:length(home_seq), function(x) {
+                gather_money_lines(lines[home_seq[x]]) %>%
+                  mutate(BET_ON = games$Home_Team[x],
+                         HOME_AWAY = 'HOME',
+                         BET_TYPE = "MONEY_LINE",
+                         GAME_DT_TIME = dates[x],
+                         GAME_ID = paste(BET_ON, games$Away_Team[x], sep = '_'))
+              }))
+    )
+  
+  #Structure the over/unders
+  overs <- seq(from = 5, to = length(lines), by = 6)
+  unders <- overs + 1
+  
+  over_unders <-
+    rbind(
+      do.call("rbind", 
+              lapply(1:length(overs), function(x) {
+                gather_spread_lines(lines[overs[x]]) %>%
+                  mutate(BET_ON = "OVER",
+                         BET_TYPE = "OVER_UNDER",
+                         GAME_DT_TIME = dates[x],
+                         GAME_ID = paste(games$Home_Team[x], games$Away_Team[x], sep = '_'))
+              })),
+      do.call("rbind", 
+              lapply(1:length(unders), function(x) {
+                gather_spread_lines(lines[unders[x]]) %>%
+                  mutate(BET_ON = "UNDER",
+                         BET_TYPE = "OVER_UNDER",
+                         GAME_DT_TIME = dates[x],
+                         GAME_ID = paste(games$Home_Team[x], games$Away_Team[x], sep = '_'))
+              }))
+    )
+  
+  #Combine
+  data <-
+    plyr::rbind.fill(
+      spreads,
+      MLs,
+      over_unders
+    ) %>%
+    mutate(Timestamp = now())
+  
+  #Load into mongodb
+  con <-
+    mongo(
+      collection = "NFL",
+      db = "NITROGEN_LINES",
+      url = paste0('mongodb+srv://thatsmrlongcut:football17@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+    )
+  con$insert(data)
+  rm(con)
+  
+  #Close the automated browser
+  remDr$close()
+  
+}
+
