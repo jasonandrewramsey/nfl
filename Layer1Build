@@ -1,0 +1,233 @@
+#Run the script that loads the functions & Packages
+source('H:/NFL_v2/Scripts/Package_Import.R')
+source('H:/NFL_v2/Scripts/Model_Functions.R')
+
+#################################
+# Import/assign data from mongo
+#################################
+
+username <- 'thatsmrlongcut'
+password <- 'football17'
+
+#Establish connection with mongo db
+con <-
+  mongo(
+    collection = "NFL",
+    db = "PRE_PROCESS",
+    url = paste0("mongodb+srv://", username, ":", password, '@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+  )
+
+#Drop some variables from out of the gate that you won't be using and
+#Add the observation id
+pre_process <- con$find() %>%
+  mutate(obs_id = row_number(),
+         Spread_Pct_Over_Under = abs(SPREAD)/OVER_UNDER,
+         Over_Under_Coverage = ifelse(Over_Under_Differential == 0, 'push', ifelse(Over_Under_Differential > 0, 'over', 'under'))) %>%
+  dplyr::select(-one_of(c('Game_Date_Time', 'ht_id', 'at_id')))
+rm(con)
+
+#################################
+# Construct Data Frames #
+#################################
+
+#Filter the data frame for before 2009, and grab 80% for layer1 building
+eff_df <- pre_process %>%
+  filter(Season < 2009)
+
+#Layer 1 id's [Use Point Differential just to get the observations]
+set.seed(100)
+layer_1 <- createDataPartition(eff_df[,'Point_Differential'], p = 0.6, list = FALSE)
+
+#Reduce the data frame for the layer 1 observations
+eff_df <- eff_df[layer_1,]
+
+#Now save all the observations that are NOT found in the layer 1 data frame
+layer2 <- pre_process %>%
+  filter(obs_id %in% eff_df$obs_id == FALSE)
+
+#Split layer 1 into train/test .. this dataset will be used by all variables
+trainRowNumbers <- createDataPartition(eff_df[,'Point_Differential'], p = 0.8, list = FALSE)
+
+sets <- list(
+  Train = eff_df[trainRowNumbers,],
+  Test = eff_df[-trainRowNumbers,]
+)
+
+#Establish the path to drop the Layer 1 Models
+path <- 'H:/NFL_v2/Layer 1/'
+
+#Store the layer 2 for consistency/future testing
+saveRDS(layer2, paste0(path, 'layer2.rds'))
+
+#################################
+# Construct Target Variables #
+#################################
+
+#Target variables
+y_vars <- c('Over_Under_Coverage', 'Point_Differential', 'Win_Loss',
+             'Spread_Coverage', 'Game_Total_Points', 'Total_Points',
+             'Total_Points_Alwd')
+
+#Positive Classes (for classification)
+pos_classes <- c('over', NA, 'win', 'covered', NA, NA, NA)
+
+
+###################################################################################################################################
+for(k in 1:length(y_vars)) {
+  #Assign the target variable
+  target_variable <- y_vars[k]
+  
+  #Make a copy of the sets
+  data_copy <- sets
+  
+  #Rename the target variable in the copied data
+  for(i in 1:length(data_copy)) {
+    colnames(data_copy[[i]])[match(target_variable, colnames(data_copy[[i]]))] <- 'target'
+  }
+  
+  #Create the Folder if it does not exist already
+  if(target_variable %in% list.files(path)) {} else {
+    dir.create(paste(path, target_variable, sep = '/'))
+  }
+  
+  #Make the target variable name consistent
+  y <- 'target'
+  
+  #Declare the variables to be dropped
+  drop_vars <- c('Home_Team', 'Away_Team', 'Total_Points', 'Total_Points_Alwd', 'Point_Differential', 'Expected_Points', 'Expected_Points_Alwd',
+                 'Season', 'Spread_Differential', 'Spread_Coverage', 'OVER_UNDER', 'SPREAD', 'FAVORITE', 'Over_Under_Differential',
+                 'Over_Under_Coverage', 'Game_Total_Points', 'Win_Loss')
+  
+  #Declare the identity column
+  id <- 'obs_id'
+  
+  #Define the X variables
+  X <- colnames(data_copy$Train)[!(colnames(data_copy$Train) %in% c(y, id, drop_vars))]
+  
+  X <- X[(do.call("c", lapply(1:length(X), function(i) {
+    sum(is.na(data_copy$Train[,X[i]]))
+  }))/nrow(data_copy$Train)) < 0.25]
+  
+  #Reduce the sets to just these variables
+  data_copy <- lapply(1:length(data_copy), function(i) {
+    data_copy[[i]] %>%
+      dplyr::select(one_of(c(id, y, X)))
+  })
+  
+  #If the target variable is numeric or integer -- do nothing, 
+  class_y <- class(data_copy[[1]][,y])
+  if(class_y %in% c('integer', 'numeric')) {
+    class_y <- 'regr'
+  } else {
+    class_y <- 'classif'
+    #Otherwise -- find the top 2 most frequent -- and eliminate anything else
+    #To make it 2 factor
+    classes <- names(sort(table(data_copy[[i]][,y]), decreasing = TRUE))[1:2]
+    
+    #Eliminate everything that isn't in these classes
+    data_copy <- lapply(1:length(data_copy), function(i) {
+      data_copy[[i]][which(data_copy[[i]][,y] %in% classes),]
+    })
+  }
+  
+  ###############
+  # Pre Processing #
+  ###############
+  
+  #Near Zero variance
+  nzv <- unique(do.call("c", lapply(1:length(data_copy), function(i) {
+    nearZeroVar(data_copy[[i]][, -(match(y, colnames(data_copy[[i]])))], names = TRUE)
+  })))
+  
+  #Remove the near zero variance columns
+  if(length(nzv) > 0) {
+    for(i in 1:length(data_copy)) {
+      data_copy[[i]] <- data_copy[[i]][, !(colnames(data_copy[[i]]) %in% nzv)]
+    }
+  }
+  
+  #Now remove the remaining NA rows (if there are any)
+  for(i in 1:length(data_copy)) {
+    data_copy[[i]] <- data_copy[[i]] %>% 
+      na.omit()
+  }
+  
+  #Find highly correlated variables
+  fc <- 
+    unique(
+      do.call("c", 
+              lapply(1:length(data_copy), function(i) {
+                #Correlation matrix
+                mCor <- cor(data_copy[[i]][,-(match(y, colnames(data_copy[[i]])))])
+                #Find correlation
+                findCorrelation(mCor, cutoff = 0.75, exact = TRUE, names = TRUE)
+              })))
+  
+  if(length(fc) > 0) {
+    for(i in 1:length(data_copy)) {
+      data_copy[[i]] <- data_copy[[i]][, !(colnames(data_copy[[i]]) %in% fc)]
+    }
+  }
+  
+  ###############
+  # Create the Task #
+  ###############
+  
+  #Create the layer 1 task
+  task_layer1 <- lapply(1:length(data_copy), function(i) {
+    if(class_y == 'regr') {
+      makeRegrTask(
+        data = data_copy[[i]] %>%
+          dplyr::select(-one_of('obs_id')),
+        target = y
+      )
+    } else {
+      makeClassifTask(
+        data = data_copy[[i]] %>%
+          dplyr::select(-one_of('obs_id')),
+        target = y, positive = pos_classes[k]
+      )
+    }
+  })
+  
+  ###############
+  # Set the Tuning Parameters #
+  ###############
+  
+  #Set the hyper parameter search criteria
+  rancontrol <- makeTuneControlRandom(maxit = 300L)
+  
+  #Set 3 Fold Cross Validation
+  set_cv <- makeResampleDesc("CV", iters = 3L)
+  
+  #Define the number of times you want to iterate
+  n_iterations <- 5
+  
+  #Define the maximum iterations
+  n_max <- 75
+  
+  ###############
+  # Build the Layer 1 Models #
+  ###############
+  
+  rf_build <- rf_iterate(n_iterations, n_max, task_layer1, set_cv, rancontrol)
+  xgb_build <- xgb_iterate(rf_build, n_iterations, task_layer1, set_cv, rancontrol)
+  gbm_build <- gbm_iterate(rf_build, n_iterations, task_layer1, set_cv, rancontrol)
+  lm_build <- lm_iterate(rf_build, task_layer1)
+  
+  builds <- list(
+    rf = rf_build,
+    xgb = xgb_build,
+    gbm = gbm_build,
+    lm = lm_build
+  )
+  
+  ###############
+  # Save the Models
+  ###############
+  
+  for(i in 1:length(builds)) {
+    local_path <- paste(path, target_variable, paste0(names(builds)[i], '.rds'), sep = '/')
+    saveRDS(builds[[i]], local_path)
+  }
+}
