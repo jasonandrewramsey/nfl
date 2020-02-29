@@ -1,0 +1,229 @@
+#Run the script that loads the functions & Packages
+source('H:/NFL_v2/Scripts/Package_Import.R')
+source('H:/NFL_v2/Scripts/Model_Functions.R')
+
+#Read in the layer 2 data
+data <- readRDS('H:/NFL_v2/Layer 1/layer2.rds')
+
+#Seperate into train/test
+trainRowNumbers <- which(data$Season < 2009)
+train <- data[trainRowNumbers,]
+test <- data[-trainRowNumbers,]
+
+
+#Eliminate the variables that have excessive NAs in the train
+vars <- colnames(data)
+keep_vars <- vars[(do.call("c", lapply(1:length(vars), function(i) {
+  sum(is.na(train[,vars[i]]))
+}))/nrow(train)) < 0.25]
+
+#Filter for those columns
+data <- data[,keep_vars] %>%
+  na.omit()
+
+#Target variables
+y_vars <- c('Over_Under_Coverage', 'Point_Differential', 'Win_Loss',
+            'Spread_Coverage', 'Game_Total_Points', 'Total_Points',
+            'Total_Points_Alwd')
+
+#Positive Classes (for classification)
+pos_classes <- c('over', NA, 'win', 'covered', NA, NA, NA)
+
+
+#Find the best fit for each layer 1 model and sub type
+path_search <- 'H:/NFL_v2/Layer 1/'
+
+
+pred_df <- 
+  do.call("cbind.data.frame", 
+        lapply(1:length(y_vars), function(i) {
+          tgt <- y_vars[i]
+          semi_path <- paste(path_search, tgt, sep = '/')
+          do.call("cbind.data.frame", lapply(1:length(list.files(semi_path)), function(z) {
+            mod <- find_best_fit(readRDS(paste(semi_path, list.files(semi_path)[z], sep = '/')))
+            
+            idf <- data[,c(tgt, mod$Model$features)]
+            colnames(idf)[1] <- 'target'
+            
+            idf <- if(is.na(pos_classes[i])) {
+              makeRegrTask(data = idf, target = 'target')
+            } else {
+              makeClassifTask(data = idf, target = 'target')
+            }
+            
+            name <- paste(tgt, gsub('.rds', '', list.files(semi_path)[z]), sep = '_')
+            
+            saveRDS(mod, paste0('H:/NFL_v2/Layer 2/Layer 1/', name, '.rds'))
+            
+            preds <-
+              if(is.na(pos_classes[i])) {
+                predict(mod$Model, idf)$data$response } else {
+                  predict(mod$Model, idf)$data[,paste0('prob.', pos_classes[i])]
+                }
+            
+            preds <- data.frame(preds)
+            colnames(preds) <- name
+            preds
+          }))
+        }))
+
+#Combine the predictions with the additional information required
+data <- cbind.data.frame(
+  data[, c('obs_id', 'Season', 'Week', 'Home_Team', 'Away_Team', y_vars)],
+  pred_df
+)
+
+#Seperate into train/test
+trainRowNumbers <- which(data$Season < 2009)
+train <- data[trainRowNumbers,]
+test <- data[-trainRowNumbers,]
+sets <- list(Train = train,
+             Test = test)
+
+
+#Establish the path to drop the Layer 1 Models
+path <- 'H:/NFL_v2/Layer 2/'
+
+for(k in 1:length(y_vars)) {
+  #Assign the target variable
+  target_variable <- y_vars[k]
+  
+  #Make a copy of the sets
+  data_copy <- sets
+  
+  #Rename the target variable in the copied data
+  for(i in 1:length(data_copy)) {
+    colnames(data_copy[[i]])[match(target_variable, colnames(data_copy[[i]]))] <- 'target'
+  }
+  
+  #Create the Folder if it does not exist already
+  if(target_variable %in% list.files(path)) {} else {
+    dir.create(paste(path, target_variable, sep = '/'))
+  }
+  
+  #Make the target variable name consistent
+  y <- 'target'
+  
+  #Declare the variables to be dropped
+  drop_vars <- c('Home_Team', 'Away_Team', 'Total_Points', 'Total_Points_Alwd', 'Point_Differential', 'Expected_Points', 'Expected_Points_Alwd',
+                 'Season', 'Spread_Differential', 'Spread_Coverage', 'OVER_UNDER', 'SPREAD', 'FAVORITE', 'Over_Under_Differential',
+                 'Over_Under_Coverage', 'Game_Total_Points', 'Win_Loss', 'Week')
+  
+  #Declare the identity column
+  id <- 'obs_id'
+  
+  #Define the X variables
+  X <- colnames(data_copy$Train)[!(colnames(data_copy$Train) %in% c(y, id, drop_vars))]
+  
+  #Reduce the sets to just these variables
+  data_copy <- lapply(1:length(data_copy), function(i) {
+    data_copy[[i]] %>%
+      dplyr::select(one_of(c(id, y, X)))
+  })
+  
+  #If the target variable is numeric or integer -- do nothing, 
+  class_y <- class(data_copy[[1]][,y])
+  if(class_y %in% c('integer', 'numeric')) {
+    class_y <- 'regr'
+  } else {
+    class_y <- 'classif'
+    #Otherwise -- find the top 2 most frequent -- and eliminate anything else
+    #To make it 2 factor
+    classes <- names(sort(table(data_copy[[i]][,y]), decreasing = TRUE))[1:2]
+    
+    #Eliminate everything that isn't in these classes
+    data_copy <- lapply(1:length(data_copy), function(i) {
+      data_copy[[i]][which(data_copy[[i]][,y] %in% classes),]
+    })
+  }
+  
+  ###############
+  # Create the Task #
+  ###############
+  
+  #Create the layer 1 task
+  task_layer2 <- lapply(1:length(data_copy), function(i) {
+    if(class_y == 'regr') {
+      makeRegrTask(
+        data = data_copy[[i]] %>%
+          dplyr::select(-one_of('obs_id')),
+        target = y
+      )
+    } else {
+      makeClassifTask(
+        data = data_copy[[i]] %>%
+          dplyr::select(-one_of('obs_id')),
+        target = y, positive = pos_classes[k]
+      )
+    }
+  })
+  
+  ###############
+  # Set the Tuning Parameters #
+  ###############
+  
+  #Set the hyper parameter search criteria
+  rancontrol <- makeTuneControlRandom(maxit = 500L)
+  
+  #Set 3 Fold Cross Validation
+  set_cv <- makeResampleDesc("CV", iters = 3L)
+  
+  #Define the number of times you want to iterate
+  n_iterations <- 10
+  
+  #Define the maximum iterations
+  n_max <- 75
+  
+  ###############
+  # Build the Layer 1 Models #
+  ###############
+  
+  rf_build <- rf_iterate(n_iterations, n_max, task_layer2, set_cv, rancontrol)
+  xgb_build <- xgb_iterate(rf_build, n_iterations, task_layer2, set_cv, rancontrol)
+  gbm_build <- gbm_iterate(rf_build, n_iterations, task_layer2, set_cv, rancontrol)
+  lm_build <- lm_iterate(rf_build, task_layer2)
+  
+  builds <- list(
+    rf = rf_build,
+    xgb = xgb_build,
+    gbm = gbm_build,
+    lm = lm_build
+  )
+  
+  ###############
+  # Save the Models
+  ###############
+  
+  for(i in 1:length(builds)) {
+    local_path <- paste(path, target_variable, paste0(names(builds)[i], '.rds'), sep = '/')
+    saveRDS(builds[[i]], local_path)
+  }
+}
+
+
+
+
+#Establish the path
+path <- 'H:/NFL_v2/Layer 2/'
+
+lapply(1:length(y_vars), function(k) {
+  #Find and store the best models from layer 2 for each variable
+  path_lyr2 <- paste0(path, y_vars[k])
+  
+  vars <- list.files(path_lyr2)
+  
+  #Find the single best fitting model for each variable
+  best_model <-
+    find_best_fit(
+      lapply(1:length(vars), function(x) {
+        find_best_fit(readRDS(paste(path_lyr2, vars[x], sep = '/')))
+      }))
+  
+  #Save the model in the appropriate path
+  save_path <- 'H:/NFL_v2/Stacked Models/Layer 2/'
+  
+  #Save and continue to next variable
+  saveRDS(best_model, 
+          paste0(save_path, paste0(y_vars[k], '_L2.rds')))
+  
+})
