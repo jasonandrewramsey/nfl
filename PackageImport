@@ -1,0 +1,87 @@
+###############
+# Import PLYR specific functions
+###############
+
+#PLYR and DPLYR do not work well when loaded together, oddly enough
+#It is recommended PLYR is loaded first, but that doesn't fix the summarise() namespace clash
+#So I created a function to import the few things we need from PLYR first
+importFrom <- function(pkg, ...) {
+  pkg <- as.character(substitute(pkg))
+  call <- match.call()
+  symbols <- vapply(3:length(call), function(i) {
+    as.character(call[[i]])
+  }, character(1))
+  ns <- loadNamespace(pkg)
+  importIntoEnv(parent.frame(), symbols, ns, symbols)
+  invisible(NULL)
+}
+
+#Import compact, rbind.fill, rename
+importFrom(plyr, compact, rename, rbind.fill)
+
+
+###############
+# Import remaining packages
+###############
+
+#Define the packages that will be imported for all scripts
+pkgs <- c('tidyverse',
+          'rvest',
+          'dplyr',
+          'tidyr',
+          'gapminder',
+          'zoo',
+          'data.table',
+          'lubridate',
+          'broom',
+          'ggplot2',
+          'ggthemes',
+          'geosphere',
+          #'car',
+          #'rms',
+          #'leaps',
+          #'FactoMineR',
+          'rpart',
+          #'neuralnet',
+          #'foreign',
+          #'nnet',
+          #'olsrr',
+          'RSelenium',
+          'stringr',
+          'jsonlite',
+          #'beepr',
+          #'gtable',
+          'caret',
+          'randomForest',
+          'mongolite',
+          'mlr',
+          #'MASS',
+          'snow',
+          'doSNOW',
+          'parallel',
+          'doParallel',
+          'parallelMap',
+          'devtools',
+          'RSelenium',
+          'rvest',
+          'RcppRoll',
+          'purrr',
+          'reticulate')
+
+#Package to install the packages (if not installed) and load them
+check.packages <- function(pkg){
+  
+  new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])]
+  
+  if (length(new.pkg))
+    
+    install.packages(new.pkg, dependencies = TRUE)
+  
+  sapply(pkg, require, character.only = TRUE)
+  
+}
+
+#Run the function over the packages
+for(i in 1:length(pkgs)) {
+  check.packages(pkgs[i])
+}
