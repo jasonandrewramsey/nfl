@@ -1,0 +1,456 @@
+#Create a function to determine the best model based on criteria
+find_best_fit <- function(model_list) {
+  type <- model_list[[1]]$Model$task.desc$type
+  
+  #Establish the grades and weights
+  if(type == 'regr') {
+    grades <- c('mae', 'mse', 'rmse', 'medae', 'medse', 'rae')
+    grade_weights <- c(.25, .25, .15, .15, .1, .1)
+    direction <- c(-1, -1, -1, -1, -1, -1)
+  } else {
+    grades <- c('auc', 'acc', 'bac', 'f1', 'tpr', 'tnr')
+    grade_weights <- c(.25, .25, .25, .05, .1, .1)
+    direction <- c(1, 1, 1, 1, 1, 1)
+  }
+  weights <- c(0, 0.5, 0.5)
+  
+  grades_df <-
+    do.call("cbind.data.frame", lapply(1:length(grades), function(i) {
+      #Gather the performance of the variable for each model output
+      sidf <- do.call("rbind", lapply(1:length(model_list), function(x) {
+        idf <- model_list[[x]]$Performance
+        data.frame(
+          Train = direction[i] * idf[1, grades[i]],
+          Test = direction[i] * idf[2, grades[i]]
+        )
+      })) %>%
+        mutate(falloff = ifelse(!is.finite(Test/Train), -1, direction[i] * ((Test/Train)-1)))
+      
+      #Range the performance from 0-1
+      sidf <- predict(
+        preProcess(sidf, "range"),
+        sidf
+      )
+      
+      #Apply the weights to allow comparison
+      scores <- do.call("c", lapply(1:nrow(sidf), function(x) { sum(weights * sidf[x,]) }))
+      
+      #Make the scores a data frame and re-name column
+      sidf <- data.frame(scores)
+      colnames(sidf) <- grades[i]
+      return(sidf)
+    }))
+  
+  #Now apply the total grade weights to determine the best model
+  best_model <- 
+  tryCatch({
+    which.max(do.call("c", lapply(1:nrow(grades_df), function(x) { sum(grade_weights * grades_df[x,]) })))
+  }, error = function(e) { } )
+  
+  if(is.null(best_model)) { best_model <- 1 }
+  
+  #Return the best model
+  return(model_list[[best_model]])
+}
+
+
+#Create a function to determine what variables should be eliminated next iteration
+find_bad_vars <- function(keep_pct, model_list) {
+  
+  #Assign weights to the summary statistics
+  weights <- c(0.5, 0.25, 0.25)
+  
+  #Compile the variable importance seen in all models
+  idf <-
+    do.call("rbind", lapply(1:length(model_list), function(x) {
+      predict(preProcess(model_list[[x]]$Importance, "range"), model_list[[x]]$Importance)
+    })) %>%
+    group_by(var) %>%
+    summarise(
+      avg = mean(Target),
+      max = max(Target),
+      min = min(Target)
+    )
+  
+  #Score the summary stats
+  idf$score <- do.call("c", lapply(1:nrow(idf), function(x) { sum(weights * idf[x,-1]) }))
+  
+  #Arrange by the score
+  idf <-
+    idf %>%
+    arrange(desc(score)) %>%
+    as.data.frame
+  
+  #Now capture the variables to eliminate
+  drop_vars <- as.character(idf$var[!(idf$var %in% idf$var[1:(floor(keep_pct*nrow(idf)))])])
+  
+  return(drop_vars)
+}
+
+#Random Forest
+rf_learner <- function(task_set, cv_info, rc_info) {
+  #Establish the type
+  type <- task_set[[1]]$type
+  
+  #Declare learner
+  rf <- if(type == 'regr') { makeLearner("regr.randomForest", par.vals = list(importance = TRUE, keep.forest = TRUE)) } else {
+    makeLearner("classif.randomForest",
+                predict.type = "prob",
+                par.vals = list(importance = TRUE, keep.forest = TRUE))
+  }
+  
+  #Set parameters
+  params <- makeParamSet(
+    makeIntegerParam("ntree", lower = 10, upper = 300),
+    makeIntegerParam("mtry", lower = 1, upper = floor(sqrt(sum(task_set[[1]]$task.desc$n.feat)))),
+    makeIntegerParam("nodesize", lower = floor(.15 * getTaskSize(task_set[[1]])), upper = floor(.5 * getTaskSize(task_set[[1]])))
+  )
+  
+  #Train
+  parallelStartSocket(detectCores())
+  
+  tune <- 
+    tuneParams(
+      learner = rf,
+      resampling = set_cv,
+      par.set = params,
+      task = task_set[[1]],
+      control = rancontrol,
+      measures = if(type == 'regr') { mse } else { bac }
+    )
+  
+  parallelStop()
+  
+  #Build model
+  model <- mlr::train(setHyperPars(rf, par.vals = tune$x), task_set[[1]])
+  
+  #Grab a resampling instance
+  rin <- makeResampleInstance(set_cv, size = floor(1 * getTaskSize(task_set[[1]])))
+  
+  #Subset with the resampling instance
+  train_inst <- if(type == 'regr') { makeRegrTask(data = getTaskData(task_set[[1]])[rin$train.inds[[1]],], 
+                                                  target = task_set[[1]]$task.desc$target) } else {
+                                                    makeClassifTask(data = getTaskData(task_set[[1]])[rin$train.inds[[1]],],
+                                                                    target = task_set[[1]]$task.desc$target, positive = task_set[[1]]$task.desc$positive)
+                                                  }
+  
+  #Create the sub-functions to gather performance and variable importance for a model
+  rf_output <- function(model, type) {
+    #Observe performance on train/test
+    performance <- cbind.data.frame(data.frame(Set = c("Train", "Test")), do.call("rbind", lapply(1:length(task_set), function(x) {
+      performance(predict(model, task_set[[x]]), if(type == 'regr') { list(mae, mse, rmse, medae, medse, rae) } else {
+        list(auc, acc, bac, f1, tpr, tnr)
+      })
+    })))
+    
+    #Gather the variable importance
+    var_imp <- cbind.data.frame(data.frame(var = rownames(importance(getLearnerModel(model)))),
+                                importance(getLearnerModel(model)))
+    
+    #If it is regression, rename '%IncMSE', if it is classification, rename 'MeanDecreaseAccuracy'
+    if(type == 'regr') { colnames(var_imp)[match('%IncMSE', colnames(var_imp))] <- 'Target' } else {
+      colnames(var_imp)[match('MeanDecreaseAccuracy', colnames(var_imp))] <- 'Target' 
+    }
+    
+    #Arrange by Target
+    var_imp <- var_imp %>%
+      arrange(desc(Target))
+    
+    #Output all the criteria
+    return(
+      list(
+        Model = model,
+        Performance = performance,
+        Importance = var_imp
+      )
+    )
+  }
+  
+  #Build the model a couple of times on the train instance (capture randomness)
+  rf_builds <- lapply(1:10, function(x) {
+    #Build the model on the hyper parameters
+    rf_model <- mlr::train(setHyperPars(rf, par.vals = tune$x), train_inst)
+    #Test the model and return the output
+    rf_output(rf_model, type)
+  })
+  
+  #Return the performance/importance/model metrics
+  return(
+    find_best_fit(rf_builds)
+  )
+}
+
+#Create the function to iterate through to do variable selection
+rf_iterate <- function(iterations, max_iters, task_set, cv_info, rc_info)  {
+  #Set the objects
+  loop <- 1
+  model_bins <- list()
+  
+  #Dummy while loop to start the variable reduction process until the max_iters has been reached
+  while(1 > 0) {
+    #Build the iteration N number of times and reduce variables
+    builds <-
+      lapply(1:iterations, function(x) {
+        rf_learner(task_set, cv_info, rc_info)
+      })
+    
+    #Grab the best fitting model, and the variables to be dropped
+    output <- find_best_fit(builds)
+    output$Drop <- find_bad_vars(0.975, builds)
+    
+    #Store the output in the model bin
+    model_bins[[loop]] <- output
+    
+    #Add 1 to the iterator
+    loop <- loop + 1
+    
+    #Check for breaks
+    if(nrow(output$Importance) < 3 | loop >= max_iters) { break }
+    
+    #Reduce the task by dropping the drop variables
+    task_set <- lapply(1:length(task_set), function(x) {
+      dropFeatures(task_set[[x]], output$Drop)
+    })
+  }
+  #Return the bins
+  return(model_bins)
+}
+#Xgboost learner
+xgb_learner <- function(task_set, cv_info, rc_info) {
+  #Establish the type
+  type <- task_set[[1]]$type
+  
+  #Declare learner
+  xgb <- if(type == "classif") {
+    makeLearner("classif.xgboost", predict.type = "prob", par.vals = list(
+      objective = "binary:logistic", eval_metric = "error", nrounds = 50
+    )) } else {
+      makeLearner("regr.xgboost")
+    }
+  
+  #Set parameters
+  params <- makeParamSet(
+    makeIntegerParam("nrounds", lower = 10, upper = 150),
+    makeIntegerParam("max_depth", lower = 1, upper = 5),
+    makeNumericParam("lambda", lower = 5, upper = 20),
+    makeNumericParam("gamma", lower = 5, upper = 20),
+    makeNumericParam("eta", lower = .01, upper = 0.3),
+    makeNumericParam("subsample", lower = 0.25, upper = 1),
+    makeNumericParam("min_child_weight", lower = 1, upper = 15),
+    makeNumericParam("colsample_bytree", lower = 0.1, upper = 0.4),
+    makeNumericParam("rate_drop", lower = .0001, upper = .1)
+  )
+  
+  #Train
+  parallelStartSocket(detectCores())
+  
+  tune <- 
+    tuneParams(
+      learner = xgb,
+      resampling = set_cv,
+      par.set = params,
+      task = task_set[[1]],
+      control = rancontrol,
+      measures = if(type == 'regr') { mse } else { bac }
+    )
+  
+  parallelStop()
+  
+  #Grab a resampling instance
+  rin <- makeResampleInstance(set_cv, size = floor(1 * getTaskSize(task_set[[1]])))
+  
+  #Subset with the resampling instance
+  train_inst <- if(type == 'regr') { makeRegrTask(data = getTaskData(task_set[[1]])[rin$train.inds[[1]],], 
+                                                  target = task_set[[1]]$task.desc$target) } else {
+                                                    makeClassifTask(data = getTaskData(task_set[[1]])[rin$train.inds[[1]],],
+                                                                    target = task_set[[1]]$task.desc$target, positive = task_set[[1]]$task.desc$positive)
+                                                  }
+  
+  #Create the sub-functions to gather performance and variable importance for a model
+  xgb_output <- function(model) {
+    #Observe performance on train/test
+    performance <- cbind.data.frame(data.frame(Set = c("Train", "Test")), do.call("rbind", lapply(1:length(task_set), function(x) {
+      performance(predict(model, task_set[[x]]), if(type == 'regr') { list(mae, mse, rmse, medae, medse, rae) } else {
+        list(auc, acc, bac, f1, tpr, tnr)
+      })
+    })))
+    
+    #Output all the criteria
+    return(
+      list(
+        Model = model,
+        Performance = performance
+      )
+    )
+  }
+  
+  #Build the model a couple of times on the train instance (capture randomness)
+  xgb_builds <- lapply(1:10, function(x) {
+    #Build the model on the hyper parameters
+    xgb_model <- mlr::train(setHyperPars(xgb, par.vals = tune$x), train_inst)
+    #Test the model and return the output
+    xgb_output(xgb_model)
+  })
+  
+  #Return the performance/importance/model metrics
+  return(
+    find_best_fit(xgb_builds)
+  )
+}
+
+#Create the xgb iterator -- depends on the random forest iterator to be ran first
+xgb_iterate <- function(rf_iterate_output, iterations, task_set, cv_info, rc_info) {
+  #Set the objects
+  models_bin <- list()
+  
+  for(i in 1:length(rf_iterate_output)) {
+    #Build the number of iterations
+    builds <- lapply(1:iterations, function(x) {
+      xgb_learner(task_set, cv_info, rc_info)
+    })
+    #Find the best model and store it
+    models_bin[[i]] <- find_best_fit(builds)
+    #Reduce the task by the drop vars in the rf iterate output
+    task_set <- lapply(1:length(task_set), function(x) {
+      dropFeatures(task_set[[x]], rf_iterate_output[[i]]$Drop)
+    })
+  }
+  
+  #Return the optimized iteration models
+  return(models_bin)
+}
+
+#Generalized Linear Model Boosted learner
+gbm_learner <- function(task_set, cv_info, rc_info) {
+  #Establish the type
+  type <- task_set[[1]]$type
+  
+  #Declare learner
+  gbm <- if(type == 'regr') { makeLearner("regr.gbm") } else {
+    makeLearner("classif.gbm", predict.type = "prob", par.vals = list(distribution = 'bernoulli'))
+  }
+  
+  #Set parameters
+  params <- makeParamSet(
+    makeIntegerParam("n.trees", lower = 10, upper = 150),
+    makeIntegerParam("interaction.depth", lower = 1, upper = 3),
+    makeIntegerParam("n.minobsinnode", lower = 1, upper = 30),
+    makeNumericParam("shrinkage", lower = .0001, upper = .03),
+    makeNumericParam("bag.fraction", lower = .3, upper = .8)
+  )
+  
+  #Train
+  parallelStartSocket(detectCores())
+  
+  tune <- 
+    tuneParams(
+      learner = gbm,
+      resampling = set_cv,
+      par.set = params,
+      task = task_set[[1]],
+      control = rancontrol,
+      measures = if(type == 'regr') { mse } else { bac }
+    )
+  
+  parallelStop()
+  
+  #Create the sub-functions to gather performance and variable importance for a model
+  gbm_output <- function(model) {
+    #Observe performance on train/test
+    performance <- cbind.data.frame(data.frame(Set = c("Train", "Test")), do.call("rbind", lapply(1:length(task_set), function(x) {
+      performance(predict(model, task_set[[x]]), if(type == 'regr') { list(mae, mse, rmse, medae, medse, rae) } else {
+        list(auc, acc, bac, f1, tpr, tnr)
+      })
+    })))
+    
+    #Output all the criteria
+    return(
+      list(
+        Model = model,
+        Performance = performance
+      )
+    )
+  }
+  
+  #Build the model a couple of times on the train instance (capture randomness)
+  gbm_builds <- lapply(1:10, function(x) {
+    #Build the model on the hyper parameters
+    gbm_model <- mlr::train(setHyperPars(gbm, par.vals = tune$x), task_set[[1]])
+    #Test the model and return the output
+    gbm_output(gbm_model)
+  })
+  
+  #Return the performance/importance/model metrics
+  return(
+    find_best_fit(gbm_builds)
+  )
+}
+
+#Create the gbm iterator -- depends on the random forest iterator to be ran first
+gbm_iterate <- function(rf_iterate_output, iterations, task_set, cv_info, rc_info) {
+  #Set the objects
+  models_bin <- list()
+  
+  for(i in 1:length(rf_iterate_output)) {
+    #Build the number of iterations
+    builds <- lapply(1:iterations, function(x) {
+      gbm_learner(task_set, cv_info, rc_info)
+    })
+    #Find the best model and store it
+    models_bin[[i]] <- find_best_fit(builds)
+    #Reduce the task by the drop vars in the rf iterate output
+    task_set <- lapply(1:length(task_set), function(x) {
+      dropFeatures(task_set[[x]], rf_iterate_output[[i]]$Drop)
+    })
+  }
+  
+  #Return the optimized iteration models
+  return(models_bin)
+}
+
+#Simple linear regression
+lm_learner <- function(task_set) {
+  #Establish the type
+  type <- task_set[[1]]$type
+  
+  #Declare the learner
+  linm <- if(type == 'regr') { makeLearner("regr.lm") } else {
+    makeLearner("classif.logreg", predict.type = 'prob')
+  }
+  
+  #Build the model
+  model <- mlr::train(linm, task_set[[1]])
+  
+  #Evaluate performance
+  performance <- 
+    cbind.data.frame(data.frame(Set = c("Train", "Test")), do.call("rbind", lapply(1:length(task_set), function(x) {
+      performance(predict(model, task_set[[x]]), if(type == 'regr') { list(mae, mse, rmse, medae, medse, rae) } else {
+        list(auc, acc, bac, f1, tpr, tnr)
+      })
+    })))
+  
+  #Output model and performance
+  return(list(
+    Model = model,
+    Performance = performance
+  ))
+  
+}
+
+#Create the gbm iterator -- depends on the random forest iterator to be ran first
+lm_iterate <- function(rf_iterate_output, task_set) {
+  #Set the objects
+  models_bin <- list()
+  
+  for(i in 1:length(rf_iterate_output)) {
+    #Run the lm learner on the task set
+    models_bin[[i]] <- lm_learner(task_set)
+    #Reduce the task by the drop vars in the rf iterate output
+    task_set <- lapply(1:length(task_set), function(x) {
+      dropFeatures(task_set[[x]], rf_iterate_output[[i]]$Drop)
+    })
+  }
+  
+  #Return the optimized iteration models
+  return(models_bin)
+}
